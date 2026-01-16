@@ -946,7 +946,7 @@ BASE_TEMPLATE = r"""
 
                   {% if _can_view_admin %}
                     <div class="sep"></div>
-                    <a href="/admin/users">🛠️ Admin</a>
+                    <a href="{{ url_for('admin.admin_home') }}">🛠️ Admin</a>
                   {% endif %}
 
                   <div class="sep"></div>

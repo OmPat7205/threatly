@@ -5256,14 +5256,6 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     min-width:0;
     flex: 1 1 auto;
   }
-
-  .top-right{
-  flex: 0 0 32%;
-  min-width:110px;
-  max-width:180px;
-}
-
-
   .pill{
     display:inline-flex;
     align-items:center;
@@ -5356,14 +5348,19 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
 
   <div class="range-row">
     <div class="seg" aria-label="Time range">
-      <a class="{{ 'active' if w=='24h' else '' }}" href="?w=24h">24h</a>
-      <a class="{{ 'active' if w=='7d' else '' }}" href="?w=7d">7d</a>
-      <a class="{{ 'active' if w=='30d' else '' }}" href="?w=30d">30d</a>
-      <a class="{{ 'active' if w=='90d' else '' }}" href="?w=90d">90d</a>
-      <a class="{{ 'active' if w=='custom' else '' }}" href="?w=custom">Custom</a>
+      <a class="{{ 'active' if w=='24h' else '' }}" href="/admin/?w=24h">24h</a>
+      <a class="{{ 'active' if w=='7d' else '' }}" href="/admin/?w=7d">7d</a>
+      <a class="{{ 'active' if w=='30d' else '' }}" href="/admin/?w=30d">30d</a>
+      <a class="{{ 'active' if w=='90d' else '' }}" href="/admin/?w=90d">90d</a>
+
+      {# Custom should preserve dates if already selected #}
+      <a class="{{ 'active' if w=='custom' else '' }}"
+        href="/admin/?w=custom{% if w_from %}&from={{ w_from }}{% endif %}{% if w_to %}&to={{ w_to }}{% endif %}">
+        Custom
+      </a>
     </div>
 
-    <form class="custom {{ 'show' if w=='custom' else '' }}" method="get" action="">
+    <form class="custom {{ 'show' if w=='custom' else '' }}" method="get" action="/admin/">
       <input type="hidden" name="w" value="custom"/>
       <input type="date" name="from" value="{{ w_from }}" aria-label="From date"/>
       <span class="muted2" style="font-weight:900;">→</span>
@@ -5534,53 +5531,46 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     </div>
   </div>
 
+  <hr style="margin:16px 0; border:none; border-top:1px solid var(--border);">
 
-  
-<hr style="margin:16px 0; border:none; border-top:1px solid var(--border);">
-
-<div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
-  <div class="kpi-card" style="padding:14px;">
-    <div class="kpi-head">
-      <div class="kpi-label">Audit volume over time</div>
-      <span class="tip" tabindex="0" data-tip="Total audit events per bucket (hour for 24h, day for longer ranges).">i</span>
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
+    <div class="kpi-card" style="padding:14px;">
+      <div class="kpi-head">
+        <div class="kpi-label">Audit volume over time</div>
+        <span class="tip" tabindex="0" data-tip="Total audit events per bucket (hour for ~2d windows, day for longer).">i</span>
+      </div>
+      <div style="height:260px; margin-top:10px;">
+        <canvas id="chartAudit"></canvas>
+      </div>
     </div>
-    <div style="height:260px; margin-top:10px;">
-      <canvas id="chartAudit"></canvas>
+
+    <div class="kpi-card" style="padding:14px;">
+      <div class="kpi-head">
+        <div class="kpi-label">Signals</div>
+        <span class="tip" tabindex="0" data-tip="Login failures and privileged actions per bucket in the selected window.">i</span>
+      </div>
+      <div style="height:260px; margin-top:10px;">
+        <canvas id="chartSignals"></canvas>
+      </div>
     </div>
   </div>
 
-  <div class="kpi-card" style="padding:14px;">
-    <div class="kpi-head">
-      <div class="kpi-label">Signals</div>
-      <span class="tip" tabindex="0" data-tip="Login failures and privileged actions per bucket in the selected window.">i</span>
-    </div>
-    <div style="height:260px; margin-top:10px;">
-      <canvas id="chartSignals"></canvas>
-    </div>
-  </div>
-</div>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+  (function(){
+    let chartAudit = null;
+    let chartSignals = null;
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script>
-(function(){
-  const w = {{ (w|tojson) }};
-  const w_from = {{ (w_from|tojson) }};
-  const w_to = {{ (w_to|tojson) }};
-
-  const params = new URLSearchParams();
-  params.set("w", w);
-  if (w === "custom") {
-    if (w_from) params.set("from", w_from);
-    if (w_to) params.set("to", w_to);
-  }
-
-  fetch("/admin/api/dashboard/series?" + params.toString())
-    .then(r => r.json())
-    .then(data => {
+    function buildCharts(data){
       const labels = data.labels || [];
       const s = (data.series || {});
 
-      new Chart(document.getElementById("chartAudit").getContext("2d"), {
+      // Destroy previous charts (critical)
+      if (chartAudit) { chartAudit.destroy(); chartAudit = null; }
+      if (chartSignals) { chartSignals.destroy(); chartSignals = null; }
+
+      const ctxA = document.getElementById("chartAudit").getContext("2d");
+      chartAudit = new Chart(ctxA, {
         type: "line",
         data: {
           labels,
@@ -5593,7 +5583,8 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
         }
       });
 
-      new Chart(document.getElementById("chartSignals").getContext("2d"), {
+      const ctxS = document.getElementById("chartSignals").getContext("2d");
+      chartSignals = new Chart(ctxS, {
         type: "line",
         data: {
           labels,
@@ -5608,21 +5599,39 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
           interaction: { mode: "index", intersect: false }
         }
       });
-    })
-    .catch(err => console.error("dashboard series fetch failed", err));
-})();
-</script>
+    }
 
+    const params = new URLSearchParams(window.location.search);
+
+    // If custom but missing both dates, mimic backend fallback
+    if (params.get("w") === "custom") {
+      const f = params.get("from") || "";
+      const t = params.get("to") || "";
+      if (!f || !t) {
+        params.delete("from");
+        params.delete("to");
+      }
+    }
+
+    fetch("/admin/api/dashboard/series?" + params.toString(), {
+      credentials: "same-origin",
+      cache: "no-store"
+    })
+      .then(r => r.json())
+      .then(data => {
+        // quick proof in console
+        console.log("dashboard series", data.debug || data.meta || {});
+        buildCharts(data);
+      })
+      .catch(err => console.error("dashboard series fetch failed", err));
+  })();
+  </script>
 
   <div class="muted" style="margin-top:10px;">
     Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
   </div>
 </div>
 """
-
-
-
-
 
 
 

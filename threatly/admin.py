@@ -175,7 +175,14 @@ def _render_admin(content_template: str, *, title: str, active: str, **ctx: Any)
 # Watchlist settings (enterprise)
 # -----------------------------
 def _now_iso_z() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return _iso_z(datetime.utcnow())
+
+def _iso_z(dt: datetime) -> str:
+    """
+    Return an ISO-8601 UTC timestamp with trailing 'Z', seconds precision.
+    Example: 2026-01-16T21:34:12Z
+    """
+    return dt.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _sha1_id(s: str) -> str:
@@ -561,7 +568,6 @@ def _watchlist_file_updated_utc() -> str:
 # -----------------------------
 # Routes
 # -----------------------------
-from datetime import datetime, timedelta
 
 @admin_bp.get("/")
 @require_perm("view_admin")
@@ -588,11 +594,15 @@ def admin_home():
             return datetime.strptime(s, "%Y-%m-%d")
         except Exception:
             return None
+    def _q(name: str, default: str = "") -> str:
+        vals = request.args.getlist(name)
+        return (vals[-1] if vals else default).strip()
 
     # ---- time window selection (query params) ----
-    w = (request.args.get("w") or "24h").strip().lower()
-    raw_from = (request.args.get("from") or "").strip()
-    raw_to = (request.args.get("to") or "").strip()
+    w = _q("w", "24h").lower()
+    raw_from = _q("from", "")
+    raw_to = _q("to", "")
+
 
     now = datetime.utcnow()
 
@@ -614,19 +624,13 @@ def admin_home():
         start_dt = now - timedelta(days=90)
         end_dt = now
 
+   
     elif w == "custom":
         d_from = _parse_date_yyyy_mm_dd(raw_from)
         d_to = _parse_date_yyyy_mm_dd(raw_to)
 
-        # if missing/invalid dates, fall back to 24h (and keep inputs blank)
-        if not d_from or not d_to:
-            w = "24h"
-            start_dt = now - timedelta(days=1)
-            end_dt = now
-            clean_from = ""
-            clean_to = ""
-        else:
-            # inclusive "to" date: end of day
+        # Stay in custom mode even if dates are missing/invalid
+        if d_from and d_to:
             start_dt = d_from
             end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
 
@@ -634,15 +638,37 @@ def admin_home():
             if end_dt < start_dt:
                 start_dt, end_dt = end_dt, start_dt
 
+            # Clamp future end dates (e.g., selecting "today") to now
+            if end_dt > now:
+                end_dt = now
+        else:
+            # keep UI in Custom, but show last 24h data until user selects dates
+            start_dt = now - timedelta(days=1)
+            end_dt = now
+            clean_from = raw_from if d_from else ""
+            clean_to = raw_to if d_to else ""
+
+
     else:
         # any unknown window -> 24h
         w = "24h"
         start_dt = now - timedelta(days=1)
         end_dt = now
+        clean_from = ""
+        clean_to = ""
+
+
+
+
+
+
+
+
 
     # Normalize to ISO strings (consistent with created_utc storage)
-    start_iso = start_dt.isoformat()
-    end_iso = end_dt.isoformat()
+    start_iso = _iso_z(start_dt)
+    end_iso = _iso_z(end_dt)
+
 
     # ---- audit KPIs windowed ----
     audit_kpis = get_admin_audit_kpis(
@@ -692,7 +718,7 @@ def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, buc
     conn = _db()
     try:
         # created_utc stored as ISO string; normalize for SQLite datetime
-        dt_expr = "datetime(replace(replace(created_utc,'T',' '),'Z',''))"
+        dt_expr = "datetime(substr(replace(replace(created_utc,'T',' '),'Z',''),1,19))"
 
         if bucket == "hour":
             key_expr = f"strftime('%Y-%m-%d %H:00', {dt_expr})"
@@ -705,8 +731,8 @@ def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, buc
             SELECT {key_expr} AS k, COUNT(*) AS n
             FROM admin_audit_events
             WHERE tenant_id = ?
-              AND {dt_expr} >= datetime(replace(replace(?,'T',' '),'Z',''))
-              AND {dt_expr} <= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
             GROUP BY k
             ORDER BY k ASC
             """,
@@ -720,8 +746,8 @@ def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, buc
             FROM admin_audit_events
             WHERE tenant_id = ?
               AND action = 'login_attempt'
-              AND {dt_expr} >= datetime(replace(replace(?,'T',' '),'Z',''))
-              AND {dt_expr} <= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
               AND (
                 instr(lower(COALESCE(details_json,'')), '"ok":false') > 0
                 OR instr(lower(COALESCE(details_json,'')), '"ok":0') > 0
@@ -748,8 +774,8 @@ def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, buc
             FROM admin_audit_events
             WHERE tenant_id = ?
               AND action IN ({ph})
-              AND {dt_expr} >= datetime(replace(replace(?,'T',' '),'Z',''))
-              AND {dt_expr} <= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
             GROUP BY k
             ORDER BY k ASC
             """,
@@ -789,9 +815,14 @@ def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, buc
 def admin_dashboard_series():
     ensure_admin_tables()
 
-    w = (request.args.get("w") or "24h").strip().lower()
-    raw_from = (request.args.get("from") or "").strip()
-    raw_to = (request.args.get("to") or "").strip()
+    def _q(name: str, default: str = "") -> str:
+        vals = request.args.getlist(name)
+        return (vals[-1] if vals else default).strip()
+
+    w = _q("w", "24h").lower()
+    raw_from = _q("from", "")
+    raw_to = _q("to", "")
+
 
     now = datetime.utcnow()
     start_dt = now - timedelta(days=1)
@@ -809,17 +840,35 @@ def admin_dashboard_series():
         start_dt = now - timedelta(days=30)
     elif w == "90d":
         start_dt = now - timedelta(days=90)
+
     elif w == "custom":
         d_from = _parse_date(raw_from)
         d_to = _parse_date(raw_to)
+
+        # Stay in custom even if dates are missing.
         if d_from and d_to:
             start_dt = d_from
             end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
 
-    start_iso = start_dt.isoformat()
-    end_iso = end_dt.isoformat()
+            # If user flipped them, swap (match admin_home behavior)
+            if end_dt < start_dt:
+                start_dt, end_dt = end_dt, start_dt
 
-    bucket = "hour" if w == "24h" else "day"
+            # Clamp future end dates (e.g., selecting "today") to now
+            if end_dt > now:
+                end_dt = now
+        else:
+            start_dt = now - timedelta(days=1)
+            end_dt = now
+
+
+
+
+    start_iso = _iso_z(start_dt)
+    end_iso = _iso_z(end_dt)
+
+
+    bucket = "hour" if (end_dt - start_dt) <= timedelta(days=2) else "day"
 
     data = _query_dashboard_series(
         tenant_id=TENANT_ID_DEFAULT,
@@ -827,6 +876,16 @@ def admin_dashboard_series():
         end_utc=end_iso,
         bucket=bucket,
     )
+
+    data["debug"] = {
+        "req_w": w,
+        "req_from": raw_from,
+        "req_to": raw_to,
+        "computed_start_iso": start_iso,
+        "computed_end_iso": end_iso,
+        "bucket": bucket,
+    }
+
     return jsonify(data)
 
 

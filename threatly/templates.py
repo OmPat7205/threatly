@@ -5534,6 +5534,86 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     </div>
   </div>
 
+
+  
+<hr style="margin:16px 0; border:none; border-top:1px solid var(--border);">
+
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
+  <div class="kpi-card" style="padding:14px;">
+    <div class="kpi-head">
+      <div class="kpi-label">Audit volume over time</div>
+      <span class="tip" tabindex="0" data-tip="Total audit events per bucket (hour for 24h, day for longer ranges).">i</span>
+    </div>
+    <div style="height:260px; margin-top:10px;">
+      <canvas id="chartAudit"></canvas>
+    </div>
+  </div>
+
+  <div class="kpi-card" style="padding:14px;">
+    <div class="kpi-head">
+      <div class="kpi-label">Signals</div>
+      <span class="tip" tabindex="0" data-tip="Login failures and privileged actions per bucket in the selected window.">i</span>
+    </div>
+    <div style="height:260px; margin-top:10px;">
+      <canvas id="chartSignals"></canvas>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+(function(){
+  const w = {{ (w|tojson) }};
+  const w_from = {{ (w_from|tojson) }};
+  const w_to = {{ (w_to|tojson) }};
+
+  const params = new URLSearchParams();
+  params.set("w", w);
+  if (w === "custom") {
+    if (w_from) params.set("from", w_from);
+    if (w_to) params.set("to", w_to);
+  }
+
+  fetch("/admin/api/dashboard/series?" + params.toString())
+    .then(r => r.json())
+    .then(data => {
+      const labels = data.labels || [];
+      const s = (data.series || {});
+
+      new Chart(document.getElementById("chartAudit").getContext("2d"), {
+        type: "line",
+        data: {
+          labels,
+          datasets: [{ label: "Audit events", data: s.audit_volume || [], tension: 0.25 }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false }
+        }
+      });
+
+      new Chart(document.getElementById("chartSignals").getContext("2d"), {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "Login failures", data: s.login_failures || [], tension: 0.25 },
+            { label: "Privileged actions", data: s.privileged_actions || [], tension: 0.25 }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false }
+        }
+      });
+    })
+    .catch(err => console.error("dashboard series fetch failed", err));
+})();
+</script>
+
+
   <div class="muted" style="margin-top:10px;">
     Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
   </div>

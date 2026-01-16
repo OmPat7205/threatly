@@ -680,6 +680,154 @@ def admin_home():
     )
 
 
+from flask import jsonify
+
+def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, bucket: str) -> Dict[str, Any]:
+    """
+    Returns labels + 3 series:
+      - audit_volume
+      - login_failures
+      - privileged_actions
+    """
+    conn = _db()
+    try:
+        # created_utc stored as ISO string; normalize for SQLite datetime
+        dt_expr = "datetime(replace(replace(created_utc,'T',' '),'Z',''))"
+
+        if bucket == "hour":
+            key_expr = f"strftime('%Y-%m-%d %H:00', {dt_expr})"
+        else:
+            key_expr = f"strftime('%Y-%m-%d', {dt_expr})"
+
+        # total audit volume
+        rows_total = conn.execute(
+            f"""
+            SELECT {key_expr} AS k, COUNT(*) AS n
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND {dt_expr} >= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND {dt_expr} <= datetime(replace(replace(?,'T',' '),'Z',''))
+            GROUP BY k
+            ORDER BY k ASC
+            """,
+            (tenant_id, start_utc, end_utc),
+        ).fetchall()
+
+        # login failures (login_attempt with ok=false in details_json)
+        rows_fail = conn.execute(
+            f"""
+            SELECT {key_expr} AS k, COUNT(*) AS n
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND action = 'login_attempt'
+              AND {dt_expr} >= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND {dt_expr} <= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND (
+                instr(lower(COALESCE(details_json,'')), '"ok":false') > 0
+                OR instr(lower(COALESCE(details_json,'')), '"ok":0') > 0
+              )
+            GROUP BY k
+            ORDER BY k ASC
+            """,
+            (tenant_id, start_utc, end_utc),
+        ).fetchall()
+
+        privileged = (
+            "user_create",
+            "user_toggle_active",
+            "user_set_role",
+            "user_reset_password",
+            "watchlist_update",
+            "watchlist_rollback",
+            "meta_set",
+        )
+        ph = ",".join(["?"] * len(privileged))
+        rows_priv = conn.execute(
+            f"""
+            SELECT {key_expr} AS k, COUNT(*) AS n
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND action IN ({ph})
+              AND {dt_expr} >= datetime(replace(replace(?,'T',' '),'Z',''))
+              AND {dt_expr} <= datetime(replace(replace(?,'T',' '),'Z',''))
+            GROUP BY k
+            ORDER BY k ASC
+            """,
+            (tenant_id, *privileged, start_utc, end_utc),
+        ).fetchall()
+
+        def to_map(rows):
+            return {str(r["k"]): int(r["n"]) for r in rows if r["k"]}
+
+        m_total = to_map(rows_total)
+        m_fail = to_map(rows_fail)
+        m_priv = to_map(rows_priv)
+
+        def _parse_bucket_label(s: str) -> datetime:
+            # labels are either "YYYY-MM-DD HH:00" or "YYYY-MM-DD"
+            if len(s) > 10:
+                return datetime.strptime(s, "%Y-%m-%d %H:%M")
+            return datetime.strptime(s, "%Y-%m-%d")
+
+        labels = sorted(set(m_total) | set(m_fail) | set(m_priv), key=_parse_bucket_label)
+       
+        return {
+            "labels": labels,
+            "series": {
+                "audit_volume": [m_total.get(k, 0) for k in labels],
+                "login_failures": [m_fail.get(k, 0) for k in labels],
+                "privileged_actions": [m_priv.get(k, 0) for k in labels],
+            },
+            "meta": {"bucket": bucket, "start_utc": start_utc, "end_utc": end_utc},
+        }
+    finally:
+        conn.close()
+
+
+@admin_bp.get("/api/dashboard/series")
+@require_perm("view_admin")
+def admin_dashboard_series():
+    ensure_admin_tables()
+
+    w = (request.args.get("w") or "24h").strip().lower()
+    raw_from = (request.args.get("from") or "").strip()
+    raw_to = (request.args.get("to") or "").strip()
+
+    now = datetime.utcnow()
+    start_dt = now - timedelta(days=1)
+    end_dt = now
+
+    def _parse_date(s: str) -> Optional[datetime]:
+        try:
+            return datetime.strptime((s or "").strip(), "%Y-%m-%d")
+        except Exception:
+            return None
+
+    if w == "7d":
+        start_dt = now - timedelta(days=7)
+    elif w == "30d":
+        start_dt = now - timedelta(days=30)
+    elif w == "90d":
+        start_dt = now - timedelta(days=90)
+    elif w == "custom":
+        d_from = _parse_date(raw_from)
+        d_to = _parse_date(raw_to)
+        if d_from and d_to:
+            start_dt = d_from
+            end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
+
+    start_iso = start_dt.isoformat()
+    end_iso = end_dt.isoformat()
+
+    bucket = "hour" if w == "24h" else "day"
+
+    data = _query_dashboard_series(
+        tenant_id=TENANT_ID_DEFAULT,
+        start_utc=start_iso,
+        end_utc=end_iso,
+        bucket=bucket,
+    )
+    return jsonify(data)
 
 
 

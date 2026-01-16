@@ -1,39 +1,36 @@
-# ---- Python ----
+# Python cache
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# ---- Virtual envs ----
+# Virtual environments (in case you ever add one here)
 .venv/
 venv/
-ENV/
-.env
-.env.*
-pip-wheel-metadata/
 
-# ---- Packaging ----
-*.egg-info/
-dist/
-build/
-
-# ---- OS / Editor ----
+# macOS junk
 .DS_Store
-.idea/
-.vscode/
 
-# ---- App/runtime artifacts ----
-instance/
+# Local state / DB artifacts
 state/
-reports/
-*.sqlite3
 *.db
+
+# Generated reports (optional – remove this line if you want them tracked)
+reports/
+
+# Logs / temp files
 *.log
 
-# ---- Backups / scratch ----
-backups/
-app_backup_*.py
-test.py
-threatly_BACKUP_WORKING/
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local DB/state
+*.db
+state.db
+seen.db

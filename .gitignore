@@ -1,0 +1,39 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtual envs ----
+.venv/
+venv/
+ENV/
+.env
+.env.*
+pip-wheel-metadata/
+
+# ---- Packaging ----
+*.egg-info/
+dist/
+build/
+
+# ---- OS / Editor ----
+.DS_Store
+.idea/
+.vscode/
+
+# ---- App/runtime artifacts ----
+instance/
+state/
+reports/
+*.sqlite3
+*.db
+*.log
+
+# ---- Backups / scratch ----
+backups/
+app_backup_*.py
+test.py
+threatly_BACKUP_WORKING/

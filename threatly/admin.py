@@ -1720,21 +1720,41 @@ def admin_audit():
 
     # map to template-friendly shape (similar to your old audit_events table)
     events: List[Dict[str, Any]] = []
+
+
     for r in rows:
+        details = r.get("details", {}) or {}
+
+        # Normalize ok from row OR (fallback) from details payload
+        raw_ok = r.get("ok", None)
+        if raw_ok is None:
+            raw_ok = details.get("ok", None)
+
+        ok_int = 0
+        if isinstance(raw_ok, bool):
+            ok_int = 1 if raw_ok else 0
+        elif isinstance(raw_ok, (int, float)):
+            ok_int = 1 if int(raw_ok) == 1 else 0
+        elif isinstance(raw_ok, str):
+            ok_int = 1 if raw_ok.strip().lower() in ("1", "true", "yes", "ok", "success") else 0
+        else:
+            ok_int = 0
+
         e = {
             "id": r.get("event_id", ""),
             "ts_utc": r.get("created_utc", ""),
             "event": r.get("action", ""),
-            "ok": 1,
+            "ok": ok_int,  # <-- REAL VALUE
             "actor_user_id": r.get("actor_user_id", ""),
             "actor_email": r.get("actor_email", ""),
             "ip": r.get("ip", ""),
             "user_agent": r.get("user_agent", ""),
             "target_type": r.get("target_type", ""),
             "target_id": r.get("target_id", ""),
-            "meta": r.get("details", {}) or {},
+            "meta": details,
         }
         events.append(e)
+
 
     if event:
         events = [e for e in events if (e.get("event") or "").lower() == event]
@@ -1753,6 +1773,7 @@ def admin_audit():
 
         events = [e for e in events if q in blob(e)]
 
+
     return _render_admin(
         TEMPLATES["admin_audit"],
         title="Admin · Audit",
@@ -1760,7 +1781,12 @@ def admin_audit():
         events=events,
         q=q,
         event=event,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        ok_raw=ok_raw,   # keep original so chip text matches URL
+        ok=ok,           # boolean or None (useful if you want)
     )
+
 
 
 # -----------------------------

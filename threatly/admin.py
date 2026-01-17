@@ -25,14 +25,8 @@ from threatly.state_db import (
     toggle_user_active,
     write_audit_event as write_admin_audit_event,
 )
-from threatly.templates import (
-    ADMIN_BASE_TEMPLATE,
-    ADMIN_DASHBOARD_TEMPLATE,
-    ADMIN_USERS_TEMPLATE,
-    ADMIN_ROLES_TEMPLATE,
-    ADMIN_AUDIT_TEMPLATE,
-    ADMIN_SETTINGS_TEMPLATE,
-)
+from threatly.templates import TEMPLATES
+
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
@@ -164,11 +158,13 @@ def _render_admin(content_template: str, *, title: str, active: str, **ctx: Any)
 
     inner_html = render_template_string(content_template, **base_ctx)
 
+
     return render_template_string(
-        ADMIN_BASE_TEMPLATE,
+        TEMPLATES["admin_base"],
         **base_ctx,
         content=inner_html,
     )
+
 
 
 # -----------------------------
@@ -183,6 +179,66 @@ def _iso_z(dt: datetime) -> str:
     Example: 2026-01-16T21:34:12Z
     """
     return dt.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def _compute_window_from_request(args) -> Tuple[str, str, str, datetime, datetime, str, str, str]:
+    """
+    Returns:
+      (w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket)
+    bucket is 'hour' for <=2 days else 'day'
+    """
+    def _q(name: str, default: str = "") -> str:
+        vals = args.getlist(name)
+        return (vals[-1] if vals else default).strip()
+
+    def _parse_date(s: str) -> Optional[datetime]:
+        try:
+            return datetime.strptime((s or "").strip(), "%Y-%m-%d")
+        except Exception:
+            return None
+
+    w = _q("w", "24h").lower()
+    raw_from = _q("from", "")
+    raw_to = _q("to", "")
+
+    now = datetime.utcnow()
+    start_dt = now - timedelta(days=1)
+    end_dt = now
+
+    if w == "7d":
+        start_dt = now - timedelta(days=7)
+    elif w == "30d":
+        start_dt = now - timedelta(days=30)
+    elif w == "90d":
+        start_dt = now - timedelta(days=90)
+    elif w == "custom":
+        d_from = _parse_date(raw_from)
+        d_to = _parse_date(raw_to)
+
+        if d_from and d_to:
+            start_dt = d_from
+            end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
+
+            # swap if flipped
+            if end_dt < start_dt:
+                start_dt, end_dt = end_dt, start_dt
+
+            # clamp "today" to now
+            if end_dt > now:
+                end_dt = now
+        else:
+            start_dt = now - timedelta(days=1)
+            end_dt = now
+    else:
+        # unknown -> 24h
+        w = "24h"
+        start_dt = now - timedelta(days=1)
+        end_dt = now
+        raw_from = ""
+        raw_to = ""
+
+    start_iso = _iso_z(start_dt)
+    end_iso = _iso_z(end_dt)
+    bucket = "hour" if (end_dt - start_dt) <= timedelta(days=2) else "day"
+    return (w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket)
 
 
 def _sha1_id(s: str) -> str:
@@ -679,7 +735,7 @@ def admin_home():
     )
 
     return _render_admin(
-        ADMIN_DASHBOARD_TEMPLATE,
+        TEMPLATES["admin_dashboard"],
         title="Admin",
         active="dashboard",
         window={
@@ -887,6 +943,139 @@ def admin_dashboard_series():
     }
 
     return jsonify(data)
+
+@admin_bp.get("/export/dashboard_series.csv")
+@require_perm("view_admin")
+def admin_export_dashboard_series_csv():
+    ensure_admin_tables()
+
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket = _compute_window_from_request(request.args)
+
+    data = _query_dashboard_series(
+        tenant_id=TENANT_ID_DEFAULT,
+        start_utc=start_iso,
+        end_utc=end_iso,
+        bucket=bucket,
+    )
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "bucket_label",
+        "audit_volume",
+        "login_failures",
+        "privileged_actions",
+        "window_w",
+        "window_from",
+        "window_to",
+        "start_utc",
+        "end_utc",
+        "bucket",
+    ])
+
+    labels = data.get("labels") or []
+    s = data.get("series") or {}
+    av = s.get("audit_volume") or []
+    lf = s.get("login_failures") or []
+    pa = s.get("privileged_actions") or []
+
+    for i, label in enumerate(labels):
+        writer.writerow([
+            label,
+            av[i] if i < len(av) else 0,
+            lf[i] if i < len(lf) else 0,
+            pa[i] if i < len(pa) else 0,
+            w,
+            raw_from,
+            raw_to,
+            start_iso,
+            end_iso,
+            bucket,
+        ])
+
+    filename = f"threatly_dashboard_series_{w}_{start_dt.date()}_{end_dt.date()}.csv"
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+@admin_bp.get("/export/audit.csv")
+@require_perm("view_admin")
+def admin_export_audit_csv():
+    ensure_admin_tables()
+
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket = _compute_window_from_request(request.args)
+
+    conn = _db()
+    try:
+        dt_expr = "datetime(substr(replace(replace(created_utc,'T',' '),'Z',''),1,19))"
+        rows = conn.execute(
+            f"""
+            SELECT
+              created_utc,
+              action,
+              actor_user_id,
+              actor_email,
+              target_type,
+              target_id,
+              ip,
+              user_agent,
+              details_json
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+            ORDER BY created_utc DESC
+            LIMIT 50000
+            """,
+            (TENANT_ID_DEFAULT, start_iso, end_iso),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "created_utc",
+        "action",
+        "actor_user_id",
+        "actor_email",
+        "target_type",
+        "target_id",
+        "ip",
+        "user_agent",
+        "details_json",
+        "window_w",
+        "window_from",
+        "window_to",
+        "start_utc",
+        "end_utc",
+    ])
+
+    for r in rows:
+        writer.writerow([
+            r["created_utc"],
+            r["action"],
+            r["actor_user_id"],
+            r["actor_email"],
+            r["target_type"],
+            r["target_id"],
+            r["ip"],
+            r["user_agent"],
+            r["details_json"],
+            w,
+            raw_from,
+            raw_to,
+            start_iso,
+            end_iso,
+        ])
+
+    filename = f"threatly_admin_audit_{w}_{start_dt.date()}_{end_dt.date()}.csv"
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 
@@ -1121,7 +1310,7 @@ def admin_users():
     users.sort(key=lambda u: (u.get("email") or "").lower())
 
     return _render_admin(
-        ADMIN_USERS_TEMPLATE,
+        TEMPLATES["admin_users"],
         title="Admin · Users",
         active="users",
         users=users,
@@ -1251,7 +1440,7 @@ def admin_roles():
     roles = [{"role": r, "perms": sorted(list(perms))} for r, perms in ROLE_PERMS.items()]
     roles.sort(key=lambda x: x["role"])
     return _render_admin(
-        ADMIN_ROLES_TEMPLATE,
+        TEMPLATES["admin_roles"],
         title="Admin · Roles",
         active="roles",
         roles=roles,
@@ -1310,7 +1499,7 @@ def admin_audit():
         events = [e for e in events if q in blob(e)]
 
     return _render_admin(
-        ADMIN_AUDIT_TEMPLATE,
+        TEMPLATES["admin_audit"],
         title="Admin · Audit",
         active="audit",
         events=events,
@@ -1343,7 +1532,7 @@ def admin_settings():
     updated_by = (cfg or {}).get("updated_by_email", "") or ""
 
     return _render_admin(
-        ADMIN_SETTINGS_TEMPLATE,
+        TEMPLATES["admin_settings"],
         title="Admin · Settings",
         active="settings",
         watchlist_text=watchlist_text,

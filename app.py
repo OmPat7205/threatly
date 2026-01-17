@@ -70,20 +70,8 @@ from threatly.state_db import (
     record_story_fingerprint,
     get_memory_map,
 )
-from threatly.templates import (
-    BASE_TEMPLATE,
-    STORY_TEMPLATE,
-    DAILY_TEMPLATE,
-    HEALTH_TEMPLATE,
-    LOGIN_TEMPLATE,
-    SHORTCUTS_TEMPLATE,
-)
+from threatly.templates import TEMPLATES
 
-# Campaign template is optional (won't crash if missing).
-try:
-    from threatly.templates import CAMPAIGN_TEMPLATE  # type: ignore
-except Exception:
-    CAMPAIGN_TEMPLATE = ""  # fallback renderer will be used if empty
 
 from threatly.utils import (
     now_utc,
@@ -2140,7 +2128,7 @@ def write_daily_report(all_stories: List[Dict[str, Any]], report_date: str) -> s
     app_url = base_url if base_url else ""
 
     html = render_template_string(
-        DAILY_TEMPLATE,
+        TEMPLATES["daily"],
         report_date=report_date,
         generated_utc=now_utc().strftime("%Y-%m-%d %H:%M UTC"),
         stories=stories,
@@ -2178,7 +2166,7 @@ def login_get():
         return redirect("/")
     next_url = (request.args.get("next") or "").strip()
     return render_template_string(
-        LOGIN_TEMPLATE, mode="login", error="", next_url=next_url, email=""
+        TEMPLATES["login"], mode="login", error="", next_url=next_url, email=""
     )
 
 
@@ -2218,7 +2206,7 @@ def login_post():
     if not email or not password:
         audit_auth_event("login_attempt", ok=False, email=email, reason="missing_fields")
         return render_template_string(
-            LOGIN_TEMPLATE,
+            TEMPLATES["login"],
             mode="login",
             error="Invalid credentials.",
             next_url=next_url,
@@ -2235,7 +2223,7 @@ def login_post():
             extra={"retry_after_s": int(retry_after)},
         )
         return render_template_string(
-            LOGIN_TEMPLATE,
+            TEMPLATES["login"],
             mode="login",
             error="Too many attempts. Try again later.",
             next_url=next_url,
@@ -2254,7 +2242,7 @@ def login_post():
             extra={"fail_count_pair": int(fail_count), "locked": bool(now_locked)},
         )
         return render_template_string(
-            LOGIN_TEMPLATE,
+            TEMPLATES["login"],
             mode="login",
             error="Too many attempts. Try again later."
             if now_locked
@@ -2293,7 +2281,7 @@ def signup_get():
         return redirect("/")
     if not SIGNUP_ENABLED:
         abort(404)
-    return render_template_string(LOGIN_TEMPLATE, mode="signup", error="", next_url="", email="")
+    return render_template_string(TEMPLATES["login"], mode="signup", error="", next_url="", email="")
 
 
 @app.post("/signup")
@@ -2306,7 +2294,7 @@ def signup_post():
 
     if not email or "@" not in email:
         return render_template_string(
-            LOGIN_TEMPLATE,
+            TEMPLATES["login"],
             mode="signup",
             error="Please use a valid email address.",
             next_url="",
@@ -2315,7 +2303,7 @@ def signup_post():
 
     if len(password) < 10:
         return render_template_string(
-            LOGIN_TEMPLATE,
+            TEMPLATES["login"],
             mode="signup",
             error="Password must be at least 10 characters.",
             next_url="",
@@ -2324,7 +2312,7 @@ def signup_post():
 
     if get_user_by_email(email):
         return render_template_string(
-            LOGIN_TEMPLATE,
+            TEMPLATES["login"],
             mode="signup",
             error="An account with that email already exists.",
             next_url="",
@@ -2516,7 +2504,7 @@ def index():
 
 
     return render_template_string(
-        BASE_TEMPLATE,
+        TEMPLATES["base"],
         items=stories,
         errors=errors,
         params=params,
@@ -2579,7 +2567,7 @@ def shortcuts():
     gate = enforce_login_if_configured()
     if gate:
         return gate
-    return render_template_string(SHORTCUTS_TEMPLATE)
+    return render_template_string(TEMPLATES["shortcuts"])
 
 
 @app.get("/campaign/<campaign_id>")
@@ -2616,63 +2604,18 @@ def campaign_view(campaign_id: str):
     label = (hits[0].get("campaign_label") or "Campaign").strip()
     graph = build_campaign_graph(hits, label)
 
-    if CAMPAIGN_TEMPLATE and CAMPAIGN_TEMPLATE.strip():
-        return render_template_string(
-            CAMPAIGN_TEMPLATE,
-            campaign_id=campaign_id,
-            tenant_id=tenant_id,
-            campaign_label=label,
-            stories=hits,
-            graph=graph,
-            rel_time=_rel_time_from_any,
-            current_user_email=current_user_email(),
-            csrf_token=_ensure_csrf_token() if current_user_id() else "",
-        )
-
     return render_template_string(
-        """
-        <!doctype html><html><head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>{{ campaign_label }}</title>
-          <style>
-            body{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding:18px; background:#0b0b10; color:#fff; }
-            a{ color:#7dd3fc; text-decoration:none; }
-            .card{ border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.03); border-radius:12px; padding:14px; margin-top:12px; }
-            .muted{ opacity:.75; font-weight:700; }
-            .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace; }
-          </style>
-        </head><body>
-          <div class="card">
-            <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:flex-end;">
-              <div>
-                <div style="font-size:20px; font-weight:950;">{{ campaign_label }}</div>
-                <div class="muted" style="margin-top:6px;">Campaign ID: <span class="mono">{{ campaign_id }}</span> · Stories: <b>{{ stories|length }}</b></div>
-              </div>
-              <div><a href="/">← Back to feed</a></div>
-            </div>
-          </div>
+    TEMPLATES["campaign"],
+    campaign_id=campaign_id,
+    tenant_id=tenant_id,
+    campaign_label=label,
+    stories=hits,
+    graph=graph,
+    rel_time=_rel_time_from_any,
+    current_user_email=current_user_email(),
+    csrf_token=_ensure_csrf_token() if current_user_id() else "",
+)
 
-          <div class="card">
-            <div style="font-weight:900; margin-bottom:8px;">Top signals</div>
-            <pre class="mono" style="white-space:pre-wrap;">{{ graph | tojson(indent=2) }}</pre>
-          </div>
-
-          {% for s in stories %}
-            <div class="card">
-              <div style="font-weight:950;">{{ s.title }}</div>
-              <div class="muted" style="margin-top:6px;">{{ s.lead_source }} · {{ s.trust }} · {{ s.severity.level }} ({{ s.severity.score }})</div>
-              <div style="margin-top:8px;">{{ s.summary }}</div>
-              <div style="margin-top:10px;"><a href="/story/{{ s.story_id }}">Open story →</a></div>
-            </div>
-          {% endfor %}
-        </body></html>
-        """,
-        campaign_id=campaign_id,
-        campaign_label=label,
-        stories=hits,
-        graph=graph,
-    )
 
 
 @app.get("/story/<story_id>")
@@ -2837,7 +2780,7 @@ def story(story_id: str):
 
 
     html = render_template_string(
-        STORY_TEMPLATE,
+        TEMPLATES["story"],
         story=st,
         qs=qs,
         status_values=STATUS_VALUES,
@@ -3518,7 +3461,7 @@ def health():
         return make_qs(params, overrides)
 
     return render_template_string(
-        HEALTH_TEMPLATE,
+        TEMPLATES["health"],
         health_rows=normalized,
         refreshed_utc=now_utc().strftime("%Y-%m-%d %H:%M UTC"),
         qs=qs,

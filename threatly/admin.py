@@ -362,6 +362,9 @@ def _compute_window_from_request(args) -> Tuple[str, str, str, datetime, datetim
     Returns:
       (w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket)
     bucket is 'hour' for <=2 days else 'day'
+    Supports:
+      - 15m, 1h, 24h, 7d, 30d, 90d, custom
+      - custom uses YYYY-MM-DD date inputs (from/to)
     """
     def _q(name: str, default: str = "") -> str:
         vals = args.getlist(name)
@@ -381,7 +384,13 @@ def _compute_window_from_request(args) -> Tuple[str, str, str, datetime, datetim
     start_dt = now - timedelta(days=1)
     end_dt = now
 
-    if w == "7d":
+    if w == "15m":
+        start_dt = now - timedelta(minutes=15)
+    elif w == "1h":
+        start_dt = now - timedelta(hours=1)
+    elif w == "24h":
+        start_dt = now - timedelta(days=1)
+    elif w == "7d":
         start_dt = now - timedelta(days=7)
     elif w == "30d":
         start_dt = now - timedelta(days=30)
@@ -395,14 +404,13 @@ def _compute_window_from_request(args) -> Tuple[str, str, str, datetime, datetim
             start_dt = d_from
             end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
 
-            # swap if flipped
             if end_dt < start_dt:
                 start_dt, end_dt = end_dt, start_dt
 
-            # clamp "today" to now
             if end_dt > now:
                 end_dt = now
         else:
+            # Stay in custom mode, but default to last 24h data if missing
             start_dt = now - timedelta(days=1)
             end_dt = now
     else:
@@ -1688,19 +1696,24 @@ def admin_roles():
 # -----------------------------
 # Audit
 # -----------------------------
+
 @admin_bp.get("/audit")
 @require_perm("view_admin")
 def admin_audit():
     """
-    Admin audit now uses state_db.admin_audit_events (enterprise, tenant-ready).
+    Enterprise audit log: window presets + power filters + load-more pagination.
     """
     ensure_admin_tables()
 
+    # basic filters
     q = (request.args.get("q") or "").strip().lower()
     event = (request.args.get("event") or "").strip().lower()
 
-    start_utc = (request.args.get("start_utc") or "").strip()
-    end_utc = (request.args.get("end_utc") or "").strip()
+    actor_email = (request.args.get("actor_email") or "").strip().lower()
+    target_type = (request.args.get("target_type") or "").strip().lower()
+    target_id = (request.args.get("target_id") or "").strip()
+    ip = (request.args.get("ip") or "").strip()
+
     ok_raw = (request.args.get("ok") or "").strip().lower()
     ok = None
     if ok_raw in ("1", "true", "yes"):
@@ -1708,28 +1721,48 @@ def admin_audit():
     elif ok_raw in ("0", "false", "no"):
         ok = False
 
+    # window presets (Option B placement)
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, _bucket = _compute_window_from_request(request.args)
+
+    # allow explicit start/end to override preset if provided
+    start_utc = (request.args.get("start_utc") or "").strip()
+    end_utc = (request.args.get("end_utc") or "").strip()
+    if not start_utc:
+        start_utc = start_iso
+    if not end_utc:
+        end_utc = end_iso
+
+    # pagination (Option B: load more)
+    limit = 120  # comfortable density; you can raise to 200
+    offset = 0
+    try:
+        offset = max(0, int((request.args.get("offset") or "0").strip()))
+    except Exception:
+        offset = 0
+
+    # Fetch one extra to detect "has more"
     rows = list_audit_events(
         tenant_id=TENANT_ID_DEFAULT,
-        limit=300,
+        limit=limit + 1,
+        offset=offset,
         start_utc=start_utc,
         end_utc=end_utc,
         action=(event or ""),
         ok=ok,
+        actor_email=actor_email,
+        target_type=target_type,
+        target_id=target_id,
+        ip=ip,
     )
 
+    has_more = len(rows) > limit
+    rows = rows[:limit]
 
-    # map to template-friendly shape (similar to your old audit_events table)
     events: List[Dict[str, Any]] = []
-
-
     for r in rows:
         details = r.get("details", {}) or {}
 
-        # Normalize ok from row OR (fallback) from details payload
-        raw_ok = r.get("ok", None)
-        if raw_ok is None:
-            raw_ok = details.get("ok", None)
-
+        raw_ok = details.get("ok", None)
         ok_int = 0
         if isinstance(raw_ok, bool):
             ok_int = 1 if raw_ok else 0
@@ -1744,7 +1777,7 @@ def admin_audit():
             "id": r.get("event_id", ""),
             "ts_utc": r.get("created_utc", ""),
             "event": r.get("action", ""),
-            "ok": ok_int,  # <-- REAL VALUE
+            "ok": ok_int,
             "actor_user_id": r.get("actor_user_id", ""),
             "actor_email": r.get("actor_email", ""),
             "ip": r.get("ip", ""),
@@ -1755,24 +1788,23 @@ def admin_audit():
         }
         events.append(e)
 
-
-    if event:
-        events = [e for e in events if (e.get("event") or "").lower() == event]
+    # free-text search (kept client-side for simplicity)
     if q:
-
         def blob(e: Dict[str, Any]) -> str:
             return " ".join(
                 [
                     str(e.get("event", "")),
                     str(e.get("actor_email", "")),
+                    str(e.get("actor_user_id", "")),
                     str(e.get("target_type", "")),
                     str(e.get("target_id", "")),
+                    str(e.get("ip", "")),
                     json.dumps(e.get("meta", {}), default=str),
                 ]
             ).lower()
-
         events = [e for e in events if q in blob(e)]
 
+    next_offset = offset + limit
 
     return _render_admin(
         TEMPLATES["admin_audit"],
@@ -1781,10 +1813,23 @@ def admin_audit():
         events=events,
         q=q,
         event=event,
+        actor_email=actor_email,
+        target_type=target_type,
+        target_id=target_id,
+        ip=ip,
+        ok_raw=ok_raw,
+        ok=ok,
+        # time window
+        w=w,
+        raw_from=raw_from,
+        raw_to=raw_to,
         start_utc=start_utc,
         end_utc=end_utc,
-        ok_raw=ok_raw,   # keep original so chip text matches URL
-        ok=ok,           # boolean or None (useful if you want)
+        # pagination
+        limit=limit,
+        offset=offset,
+        has_more=bool(has_more),
+        next_offset=next_offset,
     )
 
 

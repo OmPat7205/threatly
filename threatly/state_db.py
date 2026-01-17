@@ -1046,19 +1046,34 @@ def list_audit_events(
     *,
     tenant_id: str = "default",
     limit: int = 100,
+    offset: int = 0,
     start_utc: str = "",
     end_utc: str = "",
     action: str = "",
     ok: Optional[bool] = None,
+    actor_email: str = "",
+    target_type: str = "",
+    target_id: str = "",
+    ip: str = "",
 ) -> List[Dict[str, Any]]:
     """
     Optional filters:
-      - start_utc/end_utc: ISO strings (your canonical Z format works)
+      - start_utc/end_utc: ISO strings (lexicographic compare works with Z)
       - action: exact match
       - ok: if set, filters details_json for ok:true/false (no JSON1 required)
+      - actor_email: exact match (case-insensitive normalized on read)
+      - target_type: exact match
+      - target_id: exact match
+      - ip: exact match
+      - offset: for "Load more" pagination
     """
     lim = max(1, min(int(limit or 100), 500))
+    off = max(0, int(offset or 0))
     act = (action or "").strip()
+    ae = (actor_email or "").strip().lower()
+    tt = (target_type or "").strip().lower()
+    tid = (target_id or "").strip()
+    ipf = (ip or "").strip()
 
     where = ["tenant_id = ?"]
     params: List[Any] = [tenant_id]
@@ -1072,6 +1087,18 @@ def list_audit_events(
     if act:
         where.append("action = ?")
         params.append(act)
+    if ae:
+        where.append("lower(COALESCE(actor_email,'')) = ?")
+        params.append(ae)
+    if tt:
+        where.append("lower(COALESCE(target_type,'')) = ?")
+        params.append(tt)
+    if tid:
+        where.append("COALESCE(target_id,'') = ?")
+        params.append(tid)
+    if ipf:
+        where.append("COALESCE(ip,'') = ?")
+        params.append(ipf)
 
     if ok is True:
         where.append("""(
@@ -1095,9 +1122,9 @@ def list_audit_events(
             FROM admin_audit_events
             WHERE {where_sql}
             ORDER BY created_utc DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (*params, lim),
+            (*params, lim, off),
         ).fetchall()
 
         out: List[Dict[str, Any]] = []

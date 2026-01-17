@@ -20,11 +20,34 @@ ADMIN_AUDIT_TEMPLATE = r"""
   {%- endif -%}
 {%- endmacro %}
 
+{# --- relative time helper (best-effort) --- #}
+{% macro rel_time(s) -%}
+  {%- set x = (s or '') -%}
+  {%- if x|length >= 19 -%}
+    {%- set yyyy = x[0:4]|int -%}
+    {%- set mm = x[5:7]|int -%}
+    {%- set dd = x[8:10]|int -%}
+    {%- set hh = x[11:13]|int -%}
+    {%- set mi = x[14:16]|int -%}
+    {%- set ss = (x[17:19]|int if x|length >= 19 else 0) -%}
+    {%- set now_ts = (now_ts_utc or 0)|int -%}
+    {# JS will overwrite these labels anyway; keep server-safe fallback #}
+    {{ pretty_iso(x) }}
+  {%- else -%}
+    {{ x }}
+  {%- endif -%}
+{%- endmacro %}
+
 <div class="card">
   <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap;">
     <div>
       <div style="font-size:30px; font-weight:980; letter-spacing:-.4px;">Audit Log</div>
       <div class="muted">Scan events quickly. Expand details only when needed.</div>
+    </div>
+
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <button class="btn ghost" type="button" id="auditCompactBtn" title="Toggle compact rows">Compact</button>
+      <button class="btn ghost" type="button" id="auditTimeBtn" title="Toggle time display">Time: Absolute</button>
     </div>
   </div>
 
@@ -173,9 +196,18 @@ ADMIN_AUDIT_TEMPLATE = r"""
       margin-top:14px;
       border-radius: 14px;
       border:1px solid rgba(255,255,255,.06);
-      overflow:hidden;
+      overflow:auto; /* enables sticky header inside */
       background: rgba(255,255,255,.02);
       box-shadow: var(--shadow2);
+      max-height: 70vh;
+    }
+
+    /* Sticky header */
+    .audit-thead{
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(10px);
     }
 
     .audit-thead, .audit-tr{
@@ -187,7 +219,7 @@ ADMIN_AUDIT_TEMPLATE = r"""
     }
 
     .audit-thead{
-      background: rgba(255,255,255,.02);
+      background: rgba(14,14,18,.92);
       font-weight:950;
       color: rgba(234,241,251,.68);
       font-size:12px;
@@ -201,13 +233,24 @@ ADMIN_AUDIT_TEMPLATE = r"""
       border-top:1px solid rgba(255,255,255,.06);
       background: rgba(0,0,0,.08);
     }
-    .audit-tr:hover{ background: rgba(255,255,255,.03); }
+
+    /* Zebra striping */
+    .audit-tr:nth-child(odd){ background: rgba(0,0,0,.06); }
+    .audit-tr:nth-child(even){ background: rgba(26,31,38,.18); }
+    .audit-tr:hover{ background: rgba(255,255,255,.04); }
+
+    /* Compact mode */
+    .audit-table.compact .audit-tr{ padding:10px 14px; }
+    .audit-table.compact .audit-thead{ padding:10px 14px; }
+    .audit-table.compact .cell .val{ gap:4px; }
+    .audit-table.compact .badge{ padding:5px 9px; }
+    .audit-table.compact .chip{ height:20px; }
+    .audit-table.compact .iconbtn{ width:26px; height:26px; }
 
     .cell{ min-width:0; }
     .clip{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .wrapany{ overflow-wrap:anywhere; word-break:break-word; }
 
-    /* Make each cell stack cleanly */
     .cell .val{
       display:flex;
       flex-direction:column;
@@ -235,14 +278,22 @@ ADMIN_AUDIT_TEMPLATE = r"""
       max-width:100%;
     }
 
-    /* Result badge: consistent + centered */
+    /* Result badge: higher contrast */
     .badge.ok, .badge.fail{
       padding:6px 10px;
       min-width:54px;
       justify-content:center;
     }
-    .badge.ok{ border-color: rgba(71,227,183,.25); background: rgba(71,227,183,.08); }
-    .badge.fail{ border-color: rgba(255,210,120,.22); background: rgba(255,255,255,.06); }
+    .badge.ok{
+      border-color: rgba(0,255,160,.28);
+      background: rgba(0,120,70,.28);
+      color: rgba(90,255,190,.95);
+    }
+    .badge.fail{
+      border-color: rgba(255,70,70,.30);
+      background: rgba(120,0,0,.30);
+      color: rgba(255,140,140,.98);
+    }
 
     .chip{
       display:inline-flex;
@@ -257,6 +308,17 @@ ADMIN_AUDIT_TEMPLATE = r"""
       font-weight:900;
       font-size:12px;
       white-space:nowrap;
+      cursor: default;
+    }
+
+    /* Click-to-filter on event badge */
+    .badge.ev{
+      cursor:pointer;
+      user-select:none;
+    }
+    .badge.ev:hover{
+      background: rgba(255,255,255,.06);
+      border-color: rgba(255,255,255,.16);
     }
 
     /* UA pill: smaller so it doesn't crush the Event column */
@@ -283,14 +345,12 @@ ADMIN_AUDIT_TEMPLATE = r"""
     }
     .ua:hover{ background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.14); }
 
-    /* Make the result column feel consistent */
     .audit-tr > .cell:nth-child(3){
       display:flex;
       align-items:flex-start;
       justify-content:flex-start;
     }
 
-    /* Action button: smaller + calmer */
     .iconbtn{
       width:28px; height:28px;
       display:inline-flex; align-items:center; justify-content:center;
@@ -301,18 +361,15 @@ ADMIN_AUDIT_TEMPLATE = r"""
       user-select:none;
       color: rgba(234,241,251,.85);
       font-weight:950;
-      opacity:.85;
+      opacity:.9;
     }
-    .iconbtn:hover{ background: rgba(255,255,255,.05); border-color: rgba(255,255,255,.16); }
+    .iconbtn:hover{ background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.18); }
 
-  /* ...keep your existing styles above... */
-
-  /* ---- Meta overlay drawer (fixes the "vertical JSON" problem) ---- */
+    /* ---- Meta overlay drawer ---- */
     details.audit-details{
       position: relative;
-      display: inline-block; /* keep it anchored to the icon */
+      display: inline-block;
     }
-
     details.audit-details > summary{
       list-style:none;
       cursor:pointer;
@@ -323,7 +380,6 @@ ADMIN_AUDIT_TEMPLATE = r"""
     }
     details.audit-details > summary::-webkit-details-marker{ display:none; }
 
-    /* Overlay panel */
     .meta-box{
       position:absolute;
       right:0;
@@ -331,7 +387,6 @@ ADMIN_AUDIT_TEMPLATE = r"""
       width: min(720px, 92vw);
       max-height: 60vh;
       overflow:auto;
-
       padding:12px 14px;
       border-radius:14px;
       border:1px solid rgba(255,255,255,.10);
@@ -340,17 +395,15 @@ ADMIN_AUDIT_TEMPLATE = r"""
       z-index: 99999;
     }
 
-    /* Make JSON readable */
     .meta-pre{
       margin:0;
-      white-space: pre;          /* keep indentation */
-      overflow-wrap: normal;     /* no character wrapping */
+      white-space: pre;
+      overflow-wrap: normal;
       word-break: normal;
       font-size:12px;
       line-height:1.35;
     }
 
-    /* Optional: close hint row */
     .meta-hint{
       margin-top:10px;
       padding-top:10px;
@@ -360,11 +413,38 @@ ADMIN_AUDIT_TEMPLATE = r"""
       font-size:12px;
     }
 
+    /* Copy-to-clipboard icon */
+    .copybtn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      width:18px; height:18px;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.03);
+      color: rgba(234,241,251,.80);
+      font-size:11px;
+      font-weight:950;
+      opacity:0;
+      transform: translateY(-1px);
+      cursor:pointer;
+    }
+    .copywrap:hover .copybtn{ opacity:.95; }
+    .copybtn:hover{ background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.18); }
 
+    /* Truncation strategy for long emails/ids */
+    .truncate{
+      max-width: 240px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      display:inline-block;
+      vertical-align:bottom;
+    }
 
-    /* Mobile fallback: stacked blocks with labels */
     @media (max-width: 980px){
       .audit-thead{ display:none; }
+      .audit-table{ max-height: none; overflow: visible; }
       .audit-tr{
         grid-template-columns: 1fr;
         gap:10px;
@@ -391,13 +471,12 @@ ADMIN_AUDIT_TEMPLATE = r"""
       .audit-tr .cell .val .clip, .audit-tr .cell .val .wrapany{
         text-align:right;
       }
-      details.audit-details{ margin-top:8px; padding-top:10px; }
     }
   </style>
 
-  <div class="audit-table">
+  <div class="audit-table" id="auditTable">
     <div class="audit-thead">
-      <div>Time (UTC)</div>
+      <div>Time</div>
       <div>Event</div>
       <div>Result</div>
       <div>Actor</div>
@@ -410,9 +489,17 @@ ADMIN_AUDIT_TEMPLATE = r"""
         <!-- Time -->
         <div class="cell">
           <div class="val">
-            <div class="mono clip" title="{{ e.ts_utc }}">{{ pretty_iso(e.ts_utc) }}</div>
+            <div class="mono clip"
+                 data-ts="{{ e.ts_utc }}"
+                 data-time="abs"
+                 title="{{ e.ts_utc }}">
+              {{ pretty_iso(e.ts_utc) }}
+            </div>
             {% if e.ip %}
-              <div class="dim mono clip" title="{{ e.ip }}">IP {{ e.ip }}</div>
+              <div class="dim mono clip copywrap" title="{{ e.ip }}">
+                <span class="mono">IP <span class="copyval">{{ e.ip }}</span></span>
+                <span class="copybtn" data-copy="{{ e.ip }}" title="Copy IP">⧉</span>
+              </div>
             {% endif %}
           </div>
         </div>
@@ -421,7 +508,9 @@ ADMIN_AUDIT_TEMPLATE = r"""
         <div class="cell">
           <div class="val">
             <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0;">
-              <span class="badge clip" title="{{ e.event }}">{{ e.event }}</span>
+              <span class="badge ev clip"
+                    data-event="{{ e.event }}"
+                    title="Click to filter by this event">{{ e.event }}</span>
               {% if e.user_agent %}
                 <span class="ua" title="{{ e.user_agent }}">🧭 <span class="clip">{{ e.user_agent }}</span></span>
               {% endif %}
@@ -445,12 +534,18 @@ ADMIN_AUDIT_TEMPLATE = r"""
         <div class="cell">
           <div class="val">
             {% if e.actor_email %}
-              <div class="mono clip" title="{{ e.actor_email }}">{{ e.actor_email }}</div>
+              <div class="mono clip copywrap" title="{{ e.actor_email }}">
+                <span class="truncate copyval">{{ e.actor_email }}</span>
+                <span class="copybtn" data-copy="{{ e.actor_email }}" title="Copy email">⧉</span>
+              </div>
             {% else %}
               <div class="dim">—</div>
             {% endif %}
             {% if e.actor_user_id %}
-              <div class="dim mono clip" title="{{ e.actor_user_id }}">id {{ e.actor_user_id }}</div>
+              <div class="dim mono clip copywrap" title="{{ e.actor_user_id }}">
+                id <span class="copyval">{{ e.actor_user_id }}</span>
+                <span class="copybtn" data-copy="{{ e.actor_user_id }}" title="Copy user id">⧉</span>
+              </div>
             {% endif %}
           </div>
         </div>
@@ -461,7 +556,10 @@ ADMIN_AUDIT_TEMPLATE = r"""
             {% if e.target_type or e.target_id %}
               <div style="display:flex; align-items:center; gap:8px; min-width:0;">
                 <span class="chip">{{ e.target_type or "target" }}</span>
-                <span class="mono clip" title="{{ e.target_id }}">{{ e.target_id }}</span>
+                <span class="mono clip copywrap" title="{{ e.target_id }}">
+                  <span class="truncate copyval">{{ e.target_id }}</span>
+                  <span class="copybtn" data-copy="{{ e.target_id }}" title="Copy target id">⧉</span>
+                </span>
               </div>
             {% else %}
               <div class="dim">—</div>
@@ -476,9 +574,8 @@ ADMIN_AUDIT_TEMPLATE = r"""
               <summary class="iconbtn" title="Expand details">⋯</summary>
               <div class="meta-box">
                 <pre class="meta-pre mono">{{ e.meta | tojson(indent=2) }}</pre>
-                <div class="meta-hint">Tip: click ⋯ again to close</div>
+                <div class="meta-hint">Tip: click anywhere outside to close</div>
               </div>
-
             </details>
           {% else %}
             <span class="iconbtn" style="opacity:.35; cursor:default;" title="No details">⋯</span>
@@ -495,22 +592,152 @@ ADMIN_AUDIT_TEMPLATE = r"""
 
 <script>
   (function () {
+    // ---- Close meta drawers when clicking outside ----
     document.addEventListener("click", function (e) {
-      const openDetails = document.querySelectorAll("details.audit-details[open]");
-      openDetails.forEach((details) => {
-        if (!details.contains(e.target)) {
-          details.removeAttribute("open");
+      document.querySelectorAll("details.audit-details[open]").forEach((d) => {
+        if (!d.contains(e.target)) d.removeAttribute("open");
+      });
+    }, false);
+
+    // prevent inside clicks from bubbling to the document handler
+    document.addEventListener("click", function (e) {
+      if (e.target.closest(".meta-box")) e.stopPropagation();
+    }, true);
+
+    // ---- Copy-to-clipboard ----
+    function copyText(t) {
+      if (!t) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t).catch(function(){});
+      } else {
+        // fallback
+        const ta = document.createElement("textarea");
+        ta.value = t;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    }
+    document.addEventListener("click", function (e) {
+      const btn = e.target.closest(".copybtn");
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      copyText(btn.getAttribute("data-copy") || "");
+    }, true);
+
+    // ---- Compact mode toggle ----
+    const table = document.getElementById("auditTable");
+    const compactBtn = document.getElementById("auditCompactBtn");
+    const timeBtn = document.getElementById("auditTimeBtn");
+
+    function setCompact(on) {
+      if (!table) return;
+      if (on) table.classList.add("compact");
+      else table.classList.remove("compact");
+      try { localStorage.setItem("audit_compact", on ? "1" : "0"); } catch (e) {}
+    }
+
+    const savedCompact = (function(){
+      try { return localStorage.getItem("audit_compact"); } catch (e) { return null; }
+    })();
+    if (savedCompact === "1") setCompact(true);
+
+    if (compactBtn) {
+      compactBtn.addEventListener("click", function () {
+        const on = !table.classList.contains("compact");
+        setCompact(on);
+      });
+    }
+
+    // ---- Time toggle (absolute vs relative) ----
+    function parseIsoToMs(iso) {
+      if (!iso) return null;
+      // Accept "YYYY-MM-DDTHH:MM:SSZ" or without Z; normalize to Z for UTC
+      let s = iso.trim();
+      if (s.length >= 19 && s.indexOf("T") === -1) return null;
+      if (s.endsWith("Z")) {
+        const ms = Date.parse(s);
+        return isNaN(ms) ? null : ms;
+      }
+      // If no timezone, assume UTC (append Z)
+      if (s.length >= 19 && (s.indexOf("+") === -1 && s.indexOf("Z") === -1)) s = s + "Z";
+      const ms = Date.parse(s);
+      return isNaN(ms) ? null : ms;
+    }
+
+    function relLabel(ms) {
+      const now = Date.now();
+      let d = Math.floor((now - ms) / 1000);
+      if (d < 0) d = 0;
+      if (d < 60) return d + "s ago";
+      const m = Math.floor(d / 60);
+      if (m < 60) return m + "m ago";
+      const h = Math.floor(m / 60);
+      if (h < 48) return h + "h ago";
+      const days = Math.floor(h / 24);
+      return days + "d ago";
+    }
+
+    function setTimeMode(mode) {
+      const nodes = document.querySelectorAll('[data-ts]');
+      nodes.forEach((n) => {
+        const iso = n.getAttribute("data-ts") || "";
+        if (mode === "rel") {
+          const ms = parseIsoToMs(iso);
+          if (ms) n.textContent = relLabel(ms);
+          n.setAttribute("data-time", "rel");
+        } else {
+          // restore from title-ish: easiest is to re-render from iso with a simple absolute fallback
+          // Keep what server rendered in a data-abs attribute (first time)
+          if (!n.getAttribute("data-abs")) n.setAttribute("data-abs", n.textContent);
+          n.textContent = n.getAttribute("data-abs") || iso;
+          n.setAttribute("data-time", "abs");
         }
       });
-    });
+      try { localStorage.setItem("audit_time_mode", mode); } catch (e) {}
+      if (timeBtn) timeBtn.textContent = "Time: " + (mode === "rel" ? "Relative" : "Absolute");
+    }
 
-    // Prevent clicks inside the meta panel from bubbling up
-    document.addEventListener("click", function (e) {
-      if (e.target.closest(".meta-box")) {
-        e.stopPropagation();
+    const savedTime = (function(){
+      try { return localStorage.getItem("audit_time_mode"); } catch (e) { return null; }
+    })();
+    setTimeMode(savedTime === "rel" ? "rel" : "abs");
+
+    if (timeBtn) {
+      timeBtn.addEventListener("click", function () {
+        const cur = timeBtn.textContent.indexOf("Relative") !== -1 ? "rel" : "abs";
+        setTimeMode(cur === "rel" ? "abs" : "rel");
+      });
+    }
+
+    // ---- Click-to-filter on Event badge ----
+    function qs(params) {
+      const out = [];
+      for (const k in params) {
+        if (params[k] === null || params[k] === undefined) continue;
+        const v = String(params[k]);
+        if (!v) continue;
+        out.push(encodeURIComponent(k) + "=" + encodeURIComponent(v));
       }
-    }, true);
+      return out.join("&");
+    }
+
+    document.addEventListener("click", function (e) {
+      const badge = e.target.closest(".badge.ev");
+      if (!badge) return;
+      const ev = badge.getAttribute("data-event") || "";
+      if (!ev) return;
+
+      // Preserve existing query params but set/override "event"
+      const u = new URL(window.location.href);
+      u.searchParams.set("event", ev);
+      u.searchParams.delete("offset"); // reset paging when filtering
+      window.location.href = u.toString();
+    }, false);
   })();
 </script>
-
 """

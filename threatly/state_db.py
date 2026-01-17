@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -996,8 +996,17 @@ def write_audit_event(
                 payload[kk] = str(v)[:300]
 
     details_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) if payload else ""
-    created = now_utc().isoformat()
-    eid = _make_admin_event_id(tenant_id, created, (actor_user_id or ""), act, tt, tid, details_json)
+
+    # ✅ Canonical UTC timestamp: ISO-8601 seconds + trailing 'Z'
+    # Works perfectly with lexicographic compares and SQLite datetime() parsing.
+    created = now_utc()
+    try:
+        created_utc = created.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except Exception:
+        # ultra-safe fallback
+        created_utc = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    eid = _make_admin_event_id(tenant_id, created_utc, (actor_user_id or ""), act, tt, tid, details_json)
 
     conn = db_connect()
     try:
@@ -1023,13 +1032,14 @@ def write_audit_event(
                 details_json,
                 (ip or "")[:200],
                 (user_agent or "")[:300],
-                created,
+                created_utc,
             ),
         )
     finally:
         conn.close()
 
     return eid
+
 
 
 def list_audit_events(*, tenant_id: str = "default", limit: int = 100) -> List[Dict[str, Any]]:
@@ -1168,17 +1178,21 @@ def get_admin_audit_kpis(
     top_n: int = 10,
 ) -> Dict[str, Any]:
     """
-    ONE function (no duplicates) that supports:
-      1) Default rolling KPIs (audit_24h/7d/30d, top_actions_24h, last_event)
-      2) Custom window KPIs (start_utc/end_utc), returning window stats + aliases
+    Supports:
+      1) Rolling KPIs (audit_24h/7d/30d, top_actions_24h, last_event)
+      2) Window KPIs (start_utc/end_utc) for the admin dashboard tiles
 
-    created_utc is stored as datetime.utcnow().isoformat() (naive UTC ISO string),
-    so lexicographic comparisons work as long as format stays consistent.
+    NOTE:
+    - admin_audit_events.created_utc is stored as UTC ISO string (e.g. 2026-01-17T17:41:25Z or without Z).
+      Lexicographic comparisons work as long as format stays consistent.
+    - Login failures in your system are stored as:
+        action = 'login_attempt'
+        details_json contains `"ok":false` (or `"ok":0`)
+      NOT as action='login_fail' etc.
     """
     top_n = max(1, min(int(top_n or 10), 20))
 
-    # Define which actions count as "login failures" and "privileged"
-    login_fail_actions = {"login_fail", "auth_fail", "login_failed", "auth_login_failed"}
+    # Privileged definitions (keep yours)
     privileged_prefixes = ("user_", "watchlist_", "role_", "settings_")
     privileged_actions = {
         "user_create",
@@ -1193,7 +1207,31 @@ def get_admin_audit_kpis(
         "watchlist_update",
         "watchlist_rollback",
         "settings_updated",
+        "meta_set",
     }
+
+    def _count_login_failures(conn, *, tenant_id: str, start_utc: str, end_utc: str) -> int:
+        """
+        Counts failed login attempts in [start_utc, end_utc] based on your real schema:
+          action='login_attempt' AND details_json contains ok=false (or ok:0)
+        Uses instr/lower to avoid requiring SQLite JSON1.
+        """
+        row = conn.execute(
+            """
+            SELECT COUNT(1) AS n
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND created_utc >= ?
+              AND created_utc <= ?
+              AND action = 'login_attempt'
+              AND (
+                instr(lower(COALESCE(details_json,'')), '"ok":false') > 0
+                OR instr(lower(COALESCE(details_json,'')), '"ok":0') > 0
+              )
+            """,
+            (tenant_id, start_utc, end_utc),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
 
     # -----------------------------
     # WINDOW MODE
@@ -1256,20 +1294,10 @@ def get_admin_audit_kpis(
                     "target_id": str(last["target_id"] or ""),
                 }
 
-            # login failures in window
-            qmarks = ",".join(["?"] * len(login_fail_actions))
-            lf = conn.execute(
-                f"""
-                SELECT COUNT(1) AS n
-                FROM admin_audit_events
-                WHERE tenant_id = ?
-                  AND created_utc >= ?
-                  AND created_utc <= ?
-                  AND action IN ({qmarks})
-                """,
-                (tenant_id, start_utc, end_utc, *sorted(login_fail_actions)),
-            ).fetchone()
-            login_fail_window = int(lf["n"] or 0) if lf else 0
+            # ✅ login failures in window (matches your dashboard chart logic)
+            login_fail_window = _count_login_failures(
+                conn, tenant_id=tenant_id, start_utc=start_utc, end_utc=end_utc
+            )
 
             # privileged actions in window: explicit list
             qmarks2 = ",".join(["?"] * len(privileged_actions))
@@ -1304,7 +1332,7 @@ def get_admin_audit_kpis(
 
             privileged_window = max(privileged_count, pa2)
 
-            # NEW: unique actors in window (distinct emails)
+            # unique actors in window (distinct emails)
             ua = conn.execute(
                 """
                 SELECT COUNT(DISTINCT actor_email) AS n
@@ -1318,7 +1346,7 @@ def get_admin_audit_kpis(
             ).fetchone()
             unique_actors_window = int(ua["n"] or 0) if ua else 0
 
-            # NEW: top actors in window
+            # top actors in window
             rows = conn.execute(
                 """
                 SELECT actor_email, COUNT(1) AS n
@@ -1335,8 +1363,7 @@ def get_admin_audit_kpis(
             ).fetchall()
             top_actors = [{"actor_email": str(r["actor_email"]), "n": int(r["n"] or 0)} for r in rows]
 
-            # NEW: events by day (for tiny trend graph)
-            # created_utc is ISO: YYYY-MM-DD...
+            # events by day (for tiny trend graph)
             rows = conn.execute(
                 """
                 SELECT substr(created_utc, 1, 10) AS day, COUNT(1) AS n
@@ -1351,14 +1378,13 @@ def get_admin_audit_kpis(
             ).fetchall()
             events_by_day = [{"day": str(r["day"]), "n": int(r["n"] or 0)} for r in rows]
 
-            # Return window + aliases so your existing templates can still use kpis.audit_24h etc.
             return {
                 # window-native keys (recommended)
                 "start_utc": start_utc,
                 "end_utc": end_utc,
                 "audit_window": total,
                 "top_actions": top_actions,
-                "action_mix": top_actions,          # alias name for clarity
+                "action_mix": top_actions,
                 "last_event": last_event,
                 "login_fail_window": login_fail_window,
                 "privileged_window": privileged_window,
@@ -1366,7 +1392,7 @@ def get_admin_audit_kpis(
                 "top_actors": top_actors,
                 "events_by_day": events_by_day,
 
-                # aliases (so existing dashboard template keeps working)
+                # aliases (so older templates still work)
                 "audit_24h": total,
                 "top_actions_24h": top_actions,
                 "audit_last_event": last_event,
@@ -1380,6 +1406,8 @@ def get_admin_audit_kpis(
     # ROLLING MODE (backwards compatible)
     # -----------------------------
     now = now_utc()
+
+    # Keep your existing totals
     k24 = admin_audit_count_since(cutoff_utc=now - timedelta(days=1), tenant_id=tenant_id)
     k7 = admin_audit_count_since(cutoff_utc=now - timedelta(days=7), tenant_id=tenant_id)
     k30 = admin_audit_count_since(cutoff_utc=now - timedelta(days=30), tenant_id=tenant_id)
@@ -1391,11 +1419,26 @@ def get_admin_audit_kpis(
     )
     last = admin_audit_last_event(tenant_id=tenant_id)
 
+    # ✅ Add a rolling login failure count too (useful for any pages still reading it)
+    start_24h = (now - timedelta(days=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    end_now = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    login_fail_24h = 0
+    try:
+        conn = db_connect()
+        try:
+            _ensure_admin_audit_table(conn)
+            login_fail_24h = _count_login_failures(conn, tenant_id=tenant_id, start_utc=start_24h, end_utc=end_now)
+        finally:
+            conn.close()
+    except Exception:
+        login_fail_24h = 0
+
     return {
         "audit_24h": int(k24),
         "audit_7d": int(k7),
         "audit_30d": int(k30),
         "top_actions_24h": top_actions_24h,
         "last_event": last,
+        "login_fail_24h": int(login_fail_24h),
     }
-

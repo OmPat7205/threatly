@@ -274,7 +274,7 @@ def audit_auth_event(
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
-        "event": event,
+        "event": (event or "")[:60],
         "ok": bool(ok),
         "email": (email or "")[:254],
         "user_id": (user_id or "")[:64],
@@ -283,11 +283,45 @@ def audit_auth_event(
         "reason": (reason or "")[:200],
         "ts_utc": now_utc().isoformat(),
     }
+
     if extra:
         for k, v in list(extra.items())[:20]:
             payload[str(k)[:40]] = (
                 v if isinstance(v, (str, int, float, bool)) else str(v)[:200]
             )
+
+    # ✅ Persist auth events into admin_audit_events (so dashboard + enterprise audit trail work)
+    try:
+        details: Dict[str, Any] = {
+            "ok": bool(ok),
+            "reason": (reason or "")[:200],
+            "fail_count_pair": None,
+            "locked": None,
+        }
+
+        if extra:
+            # Flatten extra into details (safe + capped)
+            for k, v in list(extra.items())[:20]:
+                details[str(k)[:40]] = (
+                    v if isinstance(v, (str, int, float, bool)) else str(v)[:200]
+                )
+
+        write_audit_event(
+            action=(event or "")[:60],
+            actor_user_id=(user_id or "")[:80],
+            actor_email=(email or "")[:254],
+            target_type="auth",
+            target_id=(email or user_id or "")[:120],
+            details=details,
+            ip=_client_ip(),
+            user_agent=_user_agent(),
+            tenant_id=current_tenant_id(),
+        )
+    except Exception:
+        # Never break login UX if audit persistence fails
+        pass
+
+    # Keep stdout audit log too (useful in container logs)
     try:
         log.info("AUDIT %s", json.dumps(payload, separators=(",", ":"), default=str))
     except Exception:
@@ -299,6 +333,7 @@ def audit_auth_event(
             user_id,
             reason,
         )
+
 
 
 # =============================

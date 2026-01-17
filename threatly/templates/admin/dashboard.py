@@ -1,5 +1,53 @@
 ADMIN_DASHBOARD_TEMPLATE = r"""
 <style>
+
+    /* ---- Risk hierarchy + deltas ---- */
+    .kpi-card.neutral{ opacity:.92; }
+    .kpi-card.risk{
+      border-width:1.5px;
+      box-shadow: 0 12px 28px rgba(0,0,0,.34);
+    }
+    .kpi-card.level-normal{ border-color: rgba(34,197,94,.22); }
+    .kpi-card.level-warn{ border-color: rgba(245,158,11,.55); box-shadow: 0 12px 30px rgba(245,158,11,.06); }
+    .kpi-card.level-crit{ border-color: rgba(239,68,68,.70); box-shadow: 0 14px 34px rgba(239,68,68,.08); }
+
+    .kpi-delta{
+      margin-top:8px;
+      font-size:12px;
+      font-weight:850;
+      color: rgba(250,250,250,.75);
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .kpi-delta .up{ color: rgba(34,197,94,.95); }
+    .kpi-delta .down{ color: rgba(239,68,68,.95); }
+    .kpi-delta .flat{ color: rgba(250,250,250,.60); }
+
+    .risk-banner{
+      margin-top:12px;
+      padding:12px 14px;
+      border-radius:16px;
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(24,24,27,.26);
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+      flex-wrap:wrap;
+    }
+    .risk-banner strong{ font-weight:950; }
+    .risk-reasons{ color: rgba(250,250,250,.70); font-weight:800; font-size:12px; margin-top:6px; }
+    .risk-reasons .badgeish{
+      display:inline-flex; align-items:center; gap:6px;
+      padding:4px 8px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.03);
+      margin-right:6px;
+      margin-top:6px;
+    }
+
   /* ---- KPI layout + tooltip (scoped to dashboard) ---- */
   .kpi-grid{
     margin-top:12px;
@@ -314,8 +362,6 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
 
   .top-name wbr{ display:inline; }
 
-
-
   .pill{
     display:inline-flex;
     align-items:center;
@@ -346,6 +392,59 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     background: rgba(34,197,94,.85);
     width:0%;
   }
+
+  /* ---- Charts -> action (click + callouts) ---- */
+  .chart-wrap{
+    position:relative;
+  }
+  .chart-hint{
+    margin-top:10px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .chart-hint .muted2{
+    font-weight:850;
+    font-size:12px;
+  }
+  .chart-callouts{
+    margin-top:10px;
+    display:flex;
+    gap:8px;
+    flex-wrap:wrap;
+    align-items:center;
+  }
+  .callout{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    padding:6px 10px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.10);
+    background: rgba(255,255,255,.03);
+    cursor:pointer;
+    user-select:none;
+  }
+  .callout:hover{ background: rgba(255,255,255,.05); border-color: rgba(255,255,255,.14); }
+  .callout .ts{ font-weight:950; font-size:12px; color: rgba(250,250,250,.92); }
+  .callout .desc{ font-weight:850; font-size:12px; color: rgba(250,250,250,.70); }
+  .callout .badge{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    min-width:22px;
+    height:18px;
+    padding:0 7px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.12);
+    background: rgba(255,255,255,.04);
+    font-weight:950;
+    font-size:12px;
+    color: rgba(250,250,250,.92);
+  }
+
 </style>
 
 {# --- Pretty formatting helpers (no Python needed) --- #}
@@ -406,6 +505,33 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
       {% endif %}
     </span>
   </div>
+
+  {# ---- risk summary ---- #}
+  {% set overall = (kpis.overall_status if kpis and kpis.overall_status else None) %}
+  {% if overall %}
+    <div class="risk-banner">
+      <div style="min-width:0;">
+        <div style="font-size:14px; font-weight:950;">
+          {{ overall.icon }} <strong>{{ overall.label }}</strong>
+        </div>
+        {% if overall.reasons and overall.reasons|length > 0 %}
+          <div class="risk-reasons">
+            {% for r in overall.reasons %}
+              <span class="badgeish">
+                {% if r.level == 'crit' %}🚨{% elif r.level == 'warn' %}⚠️{% else %}✅{% endif %}
+                {{ r.label }}
+              </span>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="risk-reasons">No elevated risk signals detected in this window.</div>
+        {% endif %}
+      </div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <a class="btn ghost" href="/admin/audit?start_utc={{ w_start }}&end_utc={{ w_end }}">View audit for window</a>
+      </div>
+    </div>
+  {% endif %}
 
   <div class="range-row">
     <div class="seg" aria-label="Time range">
@@ -476,7 +602,21 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
       <div class="kpi-value">{{ kpis.admin_users }}</div>
     </div>
 
-    <div class="kpi-card window">
+    {% set m_audit = (kpis.window_metrics.audit_window if kpis.window_metrics else None) %}
+    <div class="kpi-card window {{ m_audit.kind if m_audit else '' }} level-{{ m_audit.level if m_audit else 'neutral' }}">
+      {% if m_audit %}
+        <div class="kpi-delta">
+          {% if m_audit.trend == 'up' %}
+            <span class="up">↑ {{ '%.1f' % m_audit.delta_pct }}% vs prev</span>
+          {% elif m_audit.trend == 'down' %}
+            <span class="down">↓ {{ '%.1f' % m_audit.delta_pct }}% vs prev</span>
+          {% else %}
+            <span class="flat">— vs prev</span>
+          {% endif %}
+          <span class="muted2">{{ m_audit.hint }}</span>
+        </div>
+      {% endif %}
+
       <div class="kpi-head">
         <div class="kpi-label">Audit <span class="kpi-badge window" title="Respects selected time window">⏱</span></div>
         <span class="tip" tabindex="0" data-tip="Count of admin audit events in the selected time window.">i</span>
@@ -552,7 +692,7 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     <div class="kpi-card window">
       <div class="kpi-head">
         <div class="kpi-label">Login failures <span class="kpi-badge window" title="Respects selected time window">⏱</span></div>
-        <span class="tip" tabindex="0" data-tip="Failed login attempts in the selected window (only increases if your auth code logs failures).">i</span>
+        <span class="tip" tabindex="0" data-tip="Failed login attempts in the selected window (action=login_attempt with ok=false in details).">i</span>
       </div>
       <div class="kpi-value">{{ kpis.login_fail_window or 0 }}</div>
     </div>
@@ -588,21 +728,31 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     <div class="kpi-card">
       <div class="kpi-head">
         <div class="kpi-label">Audit volume over time</div>
-        <span class="tip" tabindex="0" data-tip="Total audit events per bucket (hour for ~2d windows, day for longer).">i</span>
+        <span class="tip" tabindex="0" data-tip="Hover for values. Click a point to open the audit log filtered to that bucket.">i</span>
       </div>
-      <div style="height:260px; margin-top:10px;">
+      <div class="chart-wrap" style="height:260px; margin-top:10px;">
         <canvas id="chartAudit"></canvas>
       </div>
+      <div class="chart-hint">
+        <div class="muted2">Hover → details · Click → open audit for that time bucket</div>
+        <a class="btn ghost" id="btnAuditDrill" href="#">Open full window</a>
+      </div>
+      <div id="calloutsAudit" class="chart-callouts"></div>
     </div>
 
     <div class="kpi-card">
       <div class="kpi-head">
         <div class="kpi-label">Signals</div>
-        <span class="tip" tabindex="0" data-tip="Login failures and privileged actions per bucket in the selected window.">i</span>
+        <span class="tip" tabindex="0" data-tip="Hover for values. Click a point to jump into the audit log for that bucket. Spikes are auto-flagged.">i</span>
       </div>
-      <div style="height:260px; margin-top:10px;">
+      <div class="chart-wrap" style="height:260px; margin-top:10px;">
         <canvas id="chartSignals"></canvas>
       </div>
+      <div class="chart-hint">
+        <div class="muted2">Click points to investigate · Spikes generate quick-callouts below</div>
+        <a class="btn ghost" id="btnSignalsDrill" href="#">Open full window</a>
+      </div>
+      <div id="calloutsSignals" class="chart-callouts"></div>
     </div>
   </div>
 
@@ -611,34 +761,6 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
   (function(){
     let chartAudit = null;
     let chartSignals = null;
-
-    function buildCharts(data){
-      const labels = data.labels || [];
-      const s = (data.series || {});
-
-      if (chartAudit) { chartAudit.destroy(); chartAudit = null; }
-      if (chartSignals) { chartSignals.destroy(); chartSignals = null; }
-
-      const ctxA = document.getElementById("chartAudit").getContext("2d");
-      chartAudit = new Chart(ctxA, {
-        type: "line",
-        data: { labels, datasets: [{ label: "Audit events", data: s.audit_volume || [], tension: 0.25 }] },
-        options: { responsive: true, maintainAspectRatio: false, interaction: { mode: "index", intersect: false } }
-      });
-
-      const ctxS = document.getElementById("chartSignals").getContext("2d");
-      chartSignals = new Chart(ctxS, {
-        type: "line",
-        data: {
-          labels,
-          datasets: [
-            { label: "Login failures", data: s.login_failures || [], tension: 0.25 },
-            { label: "Privileged actions", data: s.privileged_actions || [], tension: 0.25 }
-          ]
-        },
-        options: { responsive: true, maintainAspectRatio: false, interaction: { mode: "index", intersect: false } }
-      });
-    }
 
     const params = new URLSearchParams(window.location.search);
 
@@ -659,6 +781,311 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
 
     const btnAudit = document.getElementById("btnExportAudit");
     if (btnAudit) btnAudit.href = "/admin/export/audit.csv" + suffix;
+
+    // "Open full window" buttons (respect selected window)
+    const btnAuditDrill = document.getElementById("btnAuditDrill");
+    const btnSignalsDrill = document.getElementById("btnSignalsDrill");
+    if (btnAuditDrill) btnAuditDrill.href = "/admin/audit" + suffix;
+    if (btnSignalsDrill) btnSignalsDrill.href = "/admin/audit" + suffix;
+
+    function isHourLabel(lbl){
+      return (lbl || "").length > 10; // "YYYY-MM-DD HH:00"
+    }
+    function bucketToIso(lbl, which){
+      // returns ISO Z timestamps for start/end of bucket
+      // hour: YYYY-MM-DD HH:00
+      // day: YYYY-MM-DD
+      const s = (lbl || "").trim();
+      if (!s) return "";
+
+      if (isHourLabel(s)){
+        const y = s.slice(0,4), m = s.slice(5,7), d = s.slice(8,10);
+        const hh = s.slice(11,13);
+        if (which === "start") return `${y}-${m}-${d}T${hh}:00:00Z`;
+        return `${y}-${m}-${d}T${hh}:59:59Z`;
+      } else {
+        // day bucket
+        if (which === "start") return `${s}T00:00:00Z`;
+        return `${s}T23:59:59Z`;
+      }
+    }
+
+    function openAuditForBucket(lbl, opts){
+      opts = opts || {};
+      const start = bucketToIso(lbl, "start");
+      const end = bucketToIso(lbl, "end");
+      const u = new URL(window.location.origin + "/admin/audit");
+      if (start) u.searchParams.set("start_utc", start);
+      if (end) u.searchParams.set("end_utc", end);
+      // optionally constrain to an action
+      if (opts.event) u.searchParams.set("event", opts.event);
+      window.location.href = u.toString();
+    }
+
+    function stats(arr){
+      const xs = (arr || []).map(v => Number(v||0)).filter(v => Number.isFinite(v));
+      if (!xs.length) return {mean:0, std:0, max:0};
+      let sum = 0;
+      for (const v of xs) sum += v;
+      const mean = sum / xs.length;
+      let varsum = 0;
+      for (const v of xs) varsum += (v - mean) * (v - mean);
+      const std = Math.sqrt(varsum / xs.length);
+      let max = 0;
+      for (const v of xs) if (v > max) max = v;
+      return {mean, std, max};
+    }
+
+    function spikeMask(arr){
+      // flags: value >= max(3, mean + 2*std) OR > previous*2 and >= 3
+      const xs = (arr || []).map(v => Number(v||0));
+      const st = stats(xs);
+      const hard = Math.max(3, st.mean + 2*st.std);
+      const out = xs.map((v, i) => {
+        const prev = (i > 0 ? xs[i-1] : 0);
+        const spike2x = (prev > 0 && v >= (prev * 2) && v >= 3);
+        return (v >= hard) || spike2x;
+      });
+      return {mask: out, threshold: hard};
+    }
+
+    function topSpikes(labels, arr, mask, limit){
+      const xs = (arr || []).map(v => Number(v||0));
+      const items = [];
+      for (let i=0; i<labels.length; i++){
+        if (!mask[i]) continue;
+        items.push({i, label: labels[i], v: xs[i]});
+      }
+      items.sort((a,b) => (b.v - a.v));
+      return items.slice(0, limit || 3);
+    }
+
+    function renderCallouts(elId, items, opts){
+      opts = opts || {};
+      const el = document.getElementById(elId);
+      if (!el) return;
+      el.innerHTML = "";
+
+      if (!items || !items.length) {
+        // keep it subtle: show nothing if no spikes
+        return;
+      }
+
+      for (const it of items){
+        const d = document.createElement("div");
+        d.className = "callout";
+        d.title = "Click to open audit log for this bucket";
+        d.addEventListener("click", () => openAuditForBucket(it.label, opts));
+
+        const ts = document.createElement("span");
+        ts.className = "ts";
+        ts.textContent = it.label;
+
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = String(it.v);
+
+        const desc = document.createElement("span");
+        desc.className = "desc";
+        desc.textContent = opts.desc || "spike";
+
+        d.appendChild(ts);
+        d.appendChild(badge);
+        d.appendChild(desc);
+        el.appendChild(d);
+      }
+    }
+
+    // Plugin: draw small "alert dots" on spike points
+    const SpikeDotsPlugin = {
+      id: "spikeDots",
+      afterDatasetsDraw(chart, args, pluginOptions){
+        const meta = chart.getDatasetMeta(0);
+        if (!meta || !meta.data) return;
+
+        const spikes = (pluginOptions && pluginOptions.spikes) || [];
+        if (!spikes.length) return;
+
+        const ctx = chart.ctx;
+        ctx.save();
+        for (let i=0; i<meta.data.length; i++){
+          if (!spikes[i]) continue;
+          const pt = meta.data[i];
+          if (!pt) continue;
+          const x = pt.x, y = pt.y;
+          // draw a small ring (no hard-coded colors elsewhere; this is minimal)
+          ctx.beginPath();
+          ctx.arc(x, y, 6, 0, Math.PI*2);
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "rgba(239,68,68,.85)";
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(x, y, 2.8, 0, Math.PI*2);
+          ctx.fillStyle = "rgba(239,68,68,.85)";
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+    };
+
+    function buildCharts(data){
+      const labels = data.labels || [];
+      const s = (data.series || {});
+      const audit = (s.audit_volume || []);
+      const login = (s.login_failures || []);
+      const priv = (s.privileged_actions || []);
+
+      const auditSpike = spikeMask(audit);
+      const loginSpike = spikeMask(login);
+      const privSpike = spikeMask(priv);
+
+      // Callouts (top spikes only)
+      renderCallouts("calloutsAudit", topSpikes(labels, audit, auditSpike.mask, 3), { desc: "audit spike" });
+      // Signals: prioritize login spikes, then privileged spikes
+      const sigItems = []
+        .concat(topSpikes(labels, login, loginSpike.mask, 3).map(x => ({...x, kind:"login"})))
+        .concat(topSpikes(labels, priv, privSpike.mask, 3).map(x => ({...x, kind:"priv"})));
+      sigItems.sort((a,b) => (b.v - a.v));
+      renderCallouts("calloutsSignals", sigItems.slice(0, 4).map(x => {
+        return { i:x.i, label:x.label, v:x.v };
+      }), { desc: "signal spike" });
+
+      if (chartAudit) { chartAudit.destroy(); chartAudit = null; }
+      if (chartSignals) { chartSignals.destroy(); chartSignals = null; }
+
+      const ctxA = document.getElementById("chartAudit").getContext("2d");
+      chartAudit = new Chart(ctxA, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [{
+            label: "Audit events",
+            data: audit,
+            tension: 0.25,
+            pointRadius: 3,
+            pointHoverRadius: 6
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            tooltip: {
+              callbacks: {
+                afterBody: function(){
+                  return ["Click to view events for this bucket"];
+                }
+              }
+            }
+          },
+          onHover: (evt, activeEls) => {
+            const canvas = evt?.native?.target;
+            if (!canvas) return;
+            canvas.style.cursor = activeEls && activeEls.length ? "pointer" : "default";
+          },
+          onClick: (evt, activeEls) => {
+            if (!activeEls || !activeEls.length) return;
+            const idx = activeEls[0].index;
+            const lbl = labels[idx];
+            openAuditForBucket(lbl, {});
+          }
+        },
+        plugins: [SpikeDotsPlugin],
+        pluginOptions: { spikeDots: { spikes: auditSpike.mask } }
+      });
+
+      // Chart.js doesn't pass pluginOptions like that; set on chart instance for our plugin:
+      chartAudit.options.plugins.spikeDots = { spikes: auditSpike.mask };
+
+      const ctxS = document.getElementById("chartSignals").getContext("2d");
+      chartSignals = new Chart(ctxS, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "Login failures", data: login, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 },
+            { label: "Privileged actions", data: priv, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            tooltip: {
+              callbacks: {
+                afterBody: function(ctx){
+                  // ctx = array of tooltip items (one per dataset)
+                  const lines = ["Click to view events for this bucket"];
+                  // helpful hint if login failures are present
+                  const hasLogin = ctx && ctx.length ? (ctx[0].label && true) : false;
+                  if (hasLogin) lines.push("Tip: filter action=login_attempt to inspect auth activity");
+                  return lines;
+                }
+              }
+            }
+          },
+          onHover: (evt, activeEls) => {
+            const canvas = evt?.native?.target;
+            if (!canvas) return;
+            canvas.style.cursor = activeEls && activeEls.length ? "pointer" : "default";
+          },
+          onClick: (evt, activeEls) => {
+            if (!activeEls || !activeEls.length) return;
+            const idx = activeEls[0].index;
+            const dsIndex = activeEls[0].datasetIndex;
+            const lbl = labels[idx];
+
+            // If they click the login series, jump with event filter (action name).
+            if (dsIndex === 0) {
+              openAuditForBucket(lbl, { event: "login_attempt" });
+            } else {
+              openAuditForBucket(lbl, {});
+            }
+          }
+        }
+      });
+
+      // draw spike dots on both datasets by layering two plugin instances (simple + robust)
+      chartSignals.config.plugins = chartSignals.config.plugins || [];
+      chartSignals.config.plugins.push({
+        id: "spikeDotsSignals",
+        afterDatasetsDraw(chart){
+          const ctx = chart.ctx;
+          const ds0 = chart.getDatasetMeta(0);
+          const ds1 = chart.getDatasetMeta(1);
+          const s0 = loginSpike.mask || [];
+          const s1 = privSpike.mask || [];
+          ctx.save();
+
+          function draw(meta, spikes, color){
+            if (!meta || !meta.data) return;
+            for (let i=0; i<meta.data.length; i++){
+              if (!spikes[i]) continue;
+              const pt = meta.data[i];
+              if (!pt) continue;
+              ctx.beginPath();
+              ctx.arc(pt.x, pt.y, 6, 0, Math.PI*2);
+              ctx.lineWidth = 2;
+              ctx.strokeStyle = color;
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.arc(pt.x, pt.y, 2.8, 0, Math.PI*2);
+              ctx.fillStyle = color;
+              ctx.fill();
+            }
+          }
+
+          draw(ds0, s0, "rgba(239,68,68,.85)"); // login spikes
+          draw(ds1, s1, "rgba(245,158,11,.85)"); // privileged spikes
+
+          ctx.restore();
+        }
+      });
+      chartSignals.update();
+    }
 
     fetch("/admin/api/dashboard/series?" + params.toString(), {
       credentials: "same-origin",

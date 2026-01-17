@@ -32,6 +32,184 @@ admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 TENANT_ID_DEFAULT = "default"
 
+# -----------------------------
+# Risk rules + KPI enrichment
+# -----------------------------
+RISK_RULES = {
+    # Windowed signals
+    "login_fail_window": {
+        "label": "Login failures",
+        "normal_max": 2,
+        "warn_at": 5,
+        "crit_at": 10,
+        "hint": "Normal range: 0–2 per window",
+        "kind": "risk",
+    },
+    "privileged_window": {
+        "label": "Privileged actions",
+        "normal_max": 0,
+        "warn_at": 1,
+        "crit_at": 3,
+        "hint": "Any privileged action deserves review",
+        "kind": "risk",
+    },
+    "audit_window": {
+        "label": "Audit events",
+        "normal_max": 50,
+        "warn_at": 150,
+        "crit_at": 300,
+        "hint": "Volume alone isn’t bad; spikes can indicate churn or probing",
+        "kind": "neutral",
+    },
+}
+
+def _pct_change(curr: int, prev: int) -> float:
+    try:
+        curr = int(curr or 0)
+        prev = int(prev or 0)
+    except Exception:
+        return 0.0
+    if prev == 0 and curr == 0:
+        return 0.0
+    if prev == 0 and curr > 0:
+        return 100.0
+    return ((curr - prev) / prev) * 100.0
+
+def _trend(curr: int, prev: int) -> str:
+    if curr > prev:
+        return "up"
+    if curr < prev:
+        return "down"
+    return "flat"
+
+def _risk_level(metric_key: str, value: int) -> Dict[str, Any]:
+    rule = RISK_RULES.get(metric_key)
+    if not rule:
+        return {"level": "neutral", "hint": "", "kind": "neutral", "label": metric_key}
+    v = int(value or 0)
+    if v >= int(rule["crit_at"]):
+        level = "crit"
+    elif v >= int(rule["warn_at"]):
+        level = "warn"
+    else:
+        level = "normal"
+    return {
+        "level": level,
+        "hint": rule.get("hint", ""),
+        "kind": rule.get("kind", "neutral"),
+        "label": rule.get("label", metric_key),
+        "normal_max": int(rule.get("normal_max", 0)),
+        "warn_at": int(rule.get("warn_at", 0)),
+        "crit_at": int(rule.get("crit_at", 0)),
+    }
+
+def _overall_status(risk_meta: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Simple exec summary:
+      - any crit -> 🚨
+      - else any warn -> ⚠️
+      - else ✅
+    Also returns "reasons" (top contributing signals).
+    """
+    levels = [m.get("level") for m in (risk_meta or {}).values()]
+    if "crit" in levels:
+        status = {"status": "critical", "icon": "🚨", "label": "Suspicious activity detected"}
+    elif "warn" in levels:
+        status = {"status": "elevated", "icon": "⚠️", "label": "Elevated risk signals"}
+    else:
+        status = {"status": "normal", "icon": "✅", "label": "Normal"}
+
+    reasons = []
+    # Prefer risk-kind KPIs, crit first
+    order = {"crit": 0, "warn": 1, "normal": 2, "neutral": 3}
+    for k, meta in sorted((risk_meta or {}).items(), key=lambda kv: order.get(kv[1].get("level", "neutral"), 9)):
+        if meta.get("kind") == "risk" and meta.get("level") in ("crit", "warn"):
+            reasons.append({"key": k, "label": meta.get("label", k), "level": meta.get("level")})
+    status["reasons"] = reasons[:3]
+    return status
+
+def _top_action_context(*, tenant_id: str, start_utc: str, end_utc: str, action: str) -> Dict[str, Any]:
+    """
+    Adds: unique actors, unique IPs, success/failure breakdown if details_json contains ok:true/false.
+    Uses instr/lower so no SQLite JSON1 dependency.
+    """
+    act = (action or "").strip()
+    if not act:
+        return {}
+
+    conn = _db()
+    try:
+        dt_expr = "datetime(substr(replace(replace(created_utc,'T',' '),'Z',''),1,19))"
+
+        # unique users + ips + total
+        row = conn.execute(
+            f"""
+            SELECT
+              COUNT(*) AS total,
+              COUNT(DISTINCT CASE WHEN actor_email <> '' THEN actor_email END) AS uniq_users,
+              COUNT(DISTINCT CASE WHEN ip <> '' THEN ip END) AS uniq_ips
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND action = ?
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+            """,
+            (tenant_id, act, start_utc, end_utc),
+        ).fetchone()
+
+        total = int(row["total"] or 0) if row else 0
+        uniq_users = int(row["uniq_users"] or 0) if row else 0
+        uniq_ips = int(row["uniq_ips"] or 0) if row else 0
+
+        # success/fail only if ok exists in details_json
+        # (we'll count both patterns ok:true / ok:false and ok:1 / ok:0)
+        succ = conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND action = ?
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND (
+                instr(lower(COALESCE(details_json,'')), '"ok":true') > 0
+                OR instr(lower(COALESCE(details_json,'')), '"ok":1') > 0
+              )
+            """,
+            (tenant_id, act, start_utc, end_utc),
+        ).fetchone()
+        fail = conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM admin_audit_events
+            WHERE tenant_id = ?
+              AND action = ?
+              AND {dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND (
+                instr(lower(COALESCE(details_json,'')), '"ok":false') > 0
+                OR instr(lower(COALESCE(details_json,'')), '"ok":0') > 0
+              )
+            """,
+            (tenant_id, act, start_utc, end_utc),
+        ).fetchone()
+
+        success_n = int(succ["n"] or 0) if succ else 0
+        fail_n = int(fail["n"] or 0) if fail else 0
+
+        has_ok = (success_n + fail_n) > 0
+
+        return {
+            "total": total,
+            "unique_users": uniq_users,
+            "unique_ips": uniq_ips,
+            "has_ok": bool(has_ok),
+            "success": success_n if has_ok else None,
+            "failure": fail_n if has_ok else None,
+        }
+    finally:
+        conn.close()
+
 
 # -----------------------------
 # DB helpers (admin-only tables)
@@ -734,6 +912,53 @@ def admin_home():
         top_n=10,
     )
 
+    # ---- previous-window comparison (same duration) ----
+    window_len = (end_dt - start_dt)
+    prev_start_dt = start_dt - window_len
+    prev_end_dt = start_dt
+    prev_start_iso = _iso_z(prev_start_dt)
+    prev_end_iso = _iso_z(prev_end_dt)
+
+    audit_prev = get_admin_audit_kpis(
+        tenant_id=TENANT_ID_DEFAULT,
+        start_utc=prev_start_iso,
+        end_utc=prev_end_iso,
+        top_n=10,
+    )
+
+    # ---- deltas + risk levels for key window KPIs ----
+    def _mk_metric(key: str) -> Dict[str, Any]:
+        curr = int(audit_kpis.get(key, 0) or 0)
+        prev = int(audit_prev.get(key, 0) or 0)
+        meta = _risk_level(key, curr)
+        meta.update({
+            "value": curr,
+            "prev": prev,
+            "delta_abs": curr - prev,
+            "delta_pct": round(_pct_change(curr, prev), 1),
+            "trend": _trend(curr, prev),
+        })
+        return meta
+
+    window_metrics = {
+        "audit_window": _mk_metric("audit_window"),
+        "login_fail_window": _mk_metric("login_fail_window"),
+        "privileged_window": _mk_metric("privileged_window"),
+    }
+
+    overall = _overall_status(window_metrics)
+
+    # ---- Top action context ----
+    top_actions = audit_kpis.get("top_actions", []) or []
+    top0 = top_actions[0] if top_actions else {}
+    top_action = str(top0.get("action") or "")
+    top_ctx = _top_action_context(
+        tenant_id=TENANT_ID_DEFAULT,
+        start_utc=start_iso,
+        end_utc=end_iso,
+        action=top_action,
+    ) if top_action else {}
+
     return _render_admin(
         TEMPLATES["admin_dashboard"],
         title="Admin",
@@ -752,14 +977,27 @@ def admin_home():
             "disabled_users": disabled,
             "admin_users": admins,
 
-            # windowed audit KPIs
+            # windowed audit KPIs (raw)
             "audit_window": int(audit_kpis.get("audit_window", 0)),
-            "top_actions": audit_kpis.get("top_actions", []),
+            "top_actions": top_actions,
             "last_event": audit_kpis.get("last_event", {}),
             "login_fail_window": int(audit_kpis.get("login_fail_window", 0)),
             "privileged_window": int(audit_kpis.get("privileged_window", 0)),
+
+            # NEW: enriched KPI meta (deltas + severity + hints)
+            "window_metrics": window_metrics,
+            "overall_status": overall,
+            "top_action_ctx": top_ctx,
+            "prev_window": {
+                "start_utc": prev_start_iso,
+                "end_utc": prev_end_iso,
+            },
         },
     )
+
+
+
+
 
 
 from flask import jsonify
@@ -1461,7 +1699,24 @@ def admin_audit():
     q = (request.args.get("q") or "").strip().lower()
     event = (request.args.get("event") or "").strip().lower()
 
-    rows = list_audit_events(limit=300)
+    start_utc = (request.args.get("start_utc") or "").strip()
+    end_utc = (request.args.get("end_utc") or "").strip()
+    ok_raw = (request.args.get("ok") or "").strip().lower()
+    ok = None
+    if ok_raw in ("1", "true", "yes"):
+        ok = True
+    elif ok_raw in ("0", "false", "no"):
+        ok = False
+
+    rows = list_audit_events(
+        tenant_id=TENANT_ID_DEFAULT,
+        limit=300,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        action=(event or ""),
+        ok=ok,
+    )
+
 
     # map to template-friendly shape (similar to your old audit_events table)
     events: List[Dict[str, Any]] = []

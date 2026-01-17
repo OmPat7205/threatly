@@ -1042,20 +1042,62 @@ def write_audit_event(
 
 
 
-def list_audit_events(*, tenant_id: str = "default", limit: int = 100) -> List[Dict[str, Any]]:
+def list_audit_events(
+    *,
+    tenant_id: str = "default",
+    limit: int = 100,
+    start_utc: str = "",
+    end_utc: str = "",
+    action: str = "",
+    ok: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Optional filters:
+      - start_utc/end_utc: ISO strings (your canonical Z format works)
+      - action: exact match
+      - ok: if set, filters details_json for ok:true/false (no JSON1 required)
+    """
     lim = max(1, min(int(limit or 100), 500))
+    act = (action or "").strip()
+
+    where = ["tenant_id = ?"]
+    params: List[Any] = [tenant_id]
+
+    if start_utc:
+        where.append("created_utc >= ?")
+        params.append(start_utc)
+    if end_utc:
+        where.append("created_utc <= ?")
+        params.append(end_utc)
+    if act:
+        where.append("action = ?")
+        params.append(act)
+
+    if ok is True:
+        where.append("""(
+            instr(lower(COALESCE(details_json,'')), '"ok":true') > 0
+            OR instr(lower(COALESCE(details_json,'')), '"ok":1') > 0
+        )""")
+    elif ok is False:
+        where.append("""(
+            instr(lower(COALESCE(details_json,'')), '"ok":false') > 0
+            OR instr(lower(COALESCE(details_json,'')), '"ok":0') > 0
+        )""")
+
+    where_sql = " AND ".join(where)
+
     conn = db_connect()
     try:
         _ensure_admin_audit_table(conn)
         rows = conn.execute(
-            """
+            f"""
             SELECT event_id, created_utc, actor_user_id, actor_email, action, target_type, target_id, details_json, ip, user_agent
             FROM admin_audit_events
-            WHERE tenant_id = ?
+            WHERE {where_sql}
             ORDER BY created_utc DESC
             LIMIT ?
             """,
-            (tenant_id, lim),
+            (*params, lim),
         ).fetchall()
 
         out: List[Dict[str, Any]] = []
@@ -1084,6 +1126,7 @@ def list_audit_events(*, tenant_id: str = "default", limit: int = 100) -> List[D
         return out
     finally:
         conn.close()
+
 
 
 # =============================

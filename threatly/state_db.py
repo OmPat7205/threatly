@@ -1467,6 +1467,9 @@ def get_admin_audit_kpis(
             (tenant_id, start_utc, end_utc),
         ).fetchone()
         return int(row["n"] or 0) if row else 0
+    
+
+
 
     # -----------------------------
     # WINDOW MODE (used by admin dashboard time filter)
@@ -1673,3 +1676,124 @@ def get_admin_audit_kpis(
         "last_event": last,
         "login_fail_24h": int(login_fail_24h),
     }
+
+
+
+def story_drilldown(
+    *,
+    kind: str,
+    value: str,
+    mode: str = "snapshot",
+    start_utc: str | None = None,
+    end_utc: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    tenant_id: str = "default",
+):
+    """
+    Returns:
+      {"rows": [...], "total": int}
+
+    NOTE:
+    - This function expects you already implemented the working drilldown query (you did, since modal shows rows now).
+    - We keep the row payload as-is.
+    - We compute total via SELECT COUNT(*) FROM (<base_query_without_limit_offset>).
+    """
+    kind = (kind or "").strip().lower()
+    value = (value or "").strip()
+    mode = (mode or "snapshot").strip().lower()
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+
+    if kind not in ("status", "assignee"):
+        return {"rows": [], "total": 0}
+    if not value:
+        return {"rows": [], "total": 0}
+    if mode not in ("snapshot", "windowed"):
+        mode = "snapshot"
+
+    conn = db_connect()
+    try:
+        # ---- IMPORTANT ----
+        # This should match the same query you already had working.
+        # If your current query differs, replace ONLY the base_sql/base_params
+        # block with your existing SELECT ... FROM ... WHERE ... (without LIMIT/OFFSET).
+        #
+        # Columns expected by frontend:
+        #   title, story_id, status, assignee, updated_at
+
+        where = ["m.tenant_id = ?"]
+        params: list = [tenant_id]
+
+        if kind == "status":
+            where.append("m.status = ?")
+            params.append(value)
+        else:
+            # assignee bucket includes "Unassigned" bucket in UI sometimes
+            if value.lower() == "unassigned":
+                where.append("(COALESCE(m.owner,'') = '')")
+            else:
+                where.append("m.owner = ?")
+                params.append(value)
+
+        # windowed = only stories updated in time range
+        if mode == "windowed" and start_utc and end_utc:
+            # created_utc/updated_utc are stored as ISO strings; normalize for sqlite datetime compares
+            dt_expr = "datetime(substr(replace(replace(m.updated_utc,'T',' '),'Z',''),1,19))"
+            where.append(
+                f"""{dt_expr} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))"""
+            )
+            where.append(
+                f"""{dt_expr} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))"""
+            )
+            params.extend([start_utc, end_utc])
+
+        where_sql = " AND ".join(where)
+
+        # ---- BASE QUERY (NO LIMIT/OFFSET HERE) ----
+        # If your existing working version pulls title from somewhere else,
+        # edit ONLY the SELECT/JOIN below (keep the total-count wrapper logic).
+        base_sql = f"""
+            SELECT
+              COALESCE(m2.title_sample, '') AS title,
+              m.story_id AS story_id,
+              COALESCE(m.status,'') AS status,
+              COALESCE(m.owner,'') AS assignee,
+              COALESCE(m.updated_utc,'') AS updated_at
+            FROM story_meta m
+            LEFT JOIN story_memory m2
+              ON m2.tenant_id = m.tenant_id
+             AND m2.last_story_id = m.story_id
+            WHERE {where_sql}
+            ORDER BY m.updated_utc DESC
+        """
+
+        # ---- TOTAL COUNT (wrap base query) ----
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM ({base_sql})",
+            params,
+        ).fetchone()
+        total = int(total_row["c"] or 0) if total_row else 0
+
+        # ---- PAGINATED ROWS ----
+        rows = conn.execute(
+            base_sql + " LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        ).fetchall()
+
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "title": str(r["title"] or ""),
+                    "story_id": str(r["story_id"] or ""),
+                    "status": str(r["status"] or ""),
+                    "assignee": str(r["assignee"] or ""),
+                    "updated_at": str(r["updated_at"] or ""),
+                }
+            )
+
+        return {"rows": out, "total": total}
+    finally:
+        conn.close()
+

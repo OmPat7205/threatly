@@ -564,9 +564,9 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
   {% set top_action = (top.get('action') if top is not none else '') %}
   {% set top_n = (top.get('n', 0) if top is not none else 0) %}
   {% set aw = (kpis.audit_window|int if kpis.audit_window is not none else 0) %}
-  {% set denom = (aw if aw > 0 else (top_n|int if top_n|int > 0 else 0)) %}
-  {% set pct = ((top_n|int * 100) / denom if denom > 0 else 0) %}
-  {% if pct > 100 %}{% set pct = 100 %}{% endif %}
+  {% set denom = (aw if aw > 0 else 0) %}
+  {% set pct = ((top_n|int * 100) / denom if denom > 0 else None) %}
+  {% if pct is not none and pct > 100 %}{% set pct = 100 %}{% endif %}
 
   <!-- Row 1 (state KPIs) -->
   <div class="kpi-grid">
@@ -646,13 +646,15 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
           <div class="kpi-sub">
             <span class="pill">{{ top_n|int }}</span>
             <span class="muted2" style="margin-left:6px;">events</span>
-            {% if denom > 0 %}
+            {% if pct is not none %}
               <span class="muted2" style="margin-left:10px;">{{ '%.0f' % pct }}% of window</span>
+            {% else %}
+              <span class="muted2" style="margin-left:10px;">—</span>
             {% endif %}
           </div>
         </div>
 
-        {% if denom > 0 %}
+        {% if pct is not none %}
           <div class="top-right">
             <div class="bar">
               <div style="width: {{ '%.0f' % pct }}%;"></div>
@@ -756,347 +758,426 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script>
-  (function(){
-    let chartAudit = null;
-    let chartSignals = null;
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
+    <div class="kpi-card">
+      <div class="kpi-head">
+        <div class="kpi-label">Story status distribution</div>
+        <span class="tip" tabindex="0" data-tip="Snapshot = current statuses. Windowed = stories touched (updated) in the selected time range.">i</span>
+      </div>
 
-    const params = new URLSearchParams(window.location.search);
+      <!-- toggle header OUTSIDE chart-wrap -->
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+        <div style="font-weight:950;">Story status</div>
+        <div class="seg" data-toggle="storyStatus">
+          <a href="#" data-mode="windowed">Windowed</a>
+          <a href="#" data-mode="snapshot">Snapshot</a>
+        </div>
+      </div>
 
-    if (params.get("w") === "custom") {
-      const f = params.get("from") || "";
-      const t = params.get("to") || "";
-      if (!f || !t) {
-        params.delete("from");
-        params.delete("to");
+      <div class="chart-wrap" style="height:260px; margin-top:10px;">
+        <canvas id="chartStoryStatus"></canvas>
+      </div>
+    </div>
+
+    <div class="kpi-card">
+      <div class="kpi-head">
+        <div class="kpi-label">Assigned stories per user</div>
+        <span class="tip" tabindex="0" data-tip="Snapshot = current assignments. Windowed = activity in range grouped by assignee.">i</span>
+      </div>
+
+      <!-- toggle header OUTSIDE chart-wrap -->
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+        <div style="font-weight:950;">Assigned stories</div>
+        <div class="seg" data-toggle="assignments">
+          <a href="#" data-mode="snapshot">Snapshot</a>
+          <a href="#" data-mode="windowed">Windowed</a>
+        </div>
+      </div>
+
+      <div class="chart-wrap" style="height:260px; margin-top:10px;">
+        <canvas id="chartAssignments"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="muted" style="margin-top:10px;">
+    Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
+  </div>
+</div>
+
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<div id="drillModal" style="display:none; position:fixed; inset:0; z-index:999999;">
+  <div id="drillBackdrop" style="position:absolute; inset:0; background:rgba(0,0,0,.55);"></div>
+
+  <div style="position:relative; max-width:980px; margin:6vh auto; background:rgba(18,18,20,.98);
+              border:1px solid rgba(255,255,255,.10); border-radius:16px; box-shadow:0 18px 40px rgba(0,0,0,.55);
+              padding:14px 14px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <div>
+        <div id="drillTitle" style="font-weight:950; font-size:16px;">Details</div>
+        <div id="drillSub" class="muted2" style="font-weight:800; font-size:12px;"></div>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button id="drillPrev" class="btn ghost" type="button">Prev</button>
+        <button id="drillNext" class="btn ghost" type="button">Next</button>
+        <button id="drillClose" class="btn" type="button">Close</button>
+      </div>
+    </div>
+
+    <div style="margin-top:12px; overflow:auto; max-height:62vh;">
+      <table style="width:100%; border-collapse:collapse;">
+        <thead>
+          <tr style="text-align:left; font-size:12px; color:rgba(250,250,250,.75);">
+            <th style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08);">Title</th>
+            <th style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); width:160px;">Status</th>
+            <th style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); width:240px;">Assignee</th>
+            <th style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); width:190px;">Updated</th>
+          </tr>
+        </thead>
+        <tbody id="drillBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+
+<script>
+(function(){
+  let chartAudit = null;
+  let chartSignals = null;
+
+  const params = new URLSearchParams(window.location.search);
+
+  // if custom is selected but missing dates, drop them (prevents weird links)
+  if (params.get("w") === "custom") {
+    const f = params.get("from") || "";
+    const t = params.get("to") || "";
+    if (!f || !t) {
+      params.delete("from");
+      params.delete("to");
+    }
+  }
+
+  const qs = params.toString();
+  const suffix = qs ? ("?" + qs) : "";
+
+  const btnSeries = document.getElementById("btnExportSeries");
+  if (btnSeries) btnSeries.href = "/admin/export/dashboard_series.csv" + suffix;
+
+  const btnAudit = document.getElementById("btnExportAudit");
+  if (btnAudit) btnAudit.href = "/admin/export/audit.csv" + suffix;
+
+  // "Open full window" buttons (respect selected window)
+  const btnAuditDrill = document.getElementById("btnAuditDrill");
+  const btnSignalsDrill = document.getElementById("btnSignalsDrill");
+  if (btnAuditDrill) btnAuditDrill.href = "/admin/audit" + suffix;
+  if (btnSignalsDrill) btnSignalsDrill.href = "/admin/audit" + suffix;
+
+  function isHourLabel(lbl){
+    return (lbl || "").length > 10; // "YYYY-MM-DD HH:00"
+  }
+
+  function bucketToIso(lbl, which){
+    // hour: YYYY-MM-DD HH:00
+    // day:  YYYY-MM-DD
+    const s = (lbl || "").trim();
+    if (!s) return "";
+
+    if (isHourLabel(s)){
+      const y = s.slice(0,4), m = s.slice(5,7), d = s.slice(8,10);
+      const hh = s.slice(11,13);
+      if (which === "start") return `${y}-${m}-${d}T${hh}:00:00Z`;
+      return `${y}-${m}-${d}T${hh}:59:59Z`;
+    } else {
+      if (which === "start") return `${s}T00:00:00Z`;
+      return `${s}T23:59:59Z`;
+    }
+  }
+
+  function openAuditForBucket(lbl, opts){
+    opts = opts || {};
+    const start = bucketToIso(lbl, "start");
+    const end = bucketToIso(lbl, "end");
+
+    const u = new URL(window.location.origin + "/admin/audit");
+    if (start) u.searchParams.set("start_utc", start);
+    if (end) u.searchParams.set("end_utc", end);
+    if (opts.event) u.searchParams.set("event", opts.event);
+    window.location.href = u.toString();
+  }
+
+  function stats(arr){
+    const xs = (arr || []).map(v => Number(v || 0)).filter(v => Number.isFinite(v));
+    if (!xs.length) return {mean:0, std:0, max:0};
+
+    let sum = 0;
+    for (const v of xs) sum += v;
+    const mean = sum / xs.length;
+
+    let varsum = 0;
+    for (const v of xs) varsum += (v - mean) * (v - mean);
+    const std = Math.sqrt(varsum / xs.length);
+
+    let max = 0;
+    for (const v of xs) if (v > max) max = v;
+
+    return {mean, std, max};
+  }
+
+  function spikeMask(arr){
+    // flags: value >= max(3, mean + 2*std) OR > previous*2 and >= 3
+    const xs = (arr || []).map(v => Number(v || 0));
+    const st = stats(xs);
+    const hard = Math.max(3, st.mean + 2 * st.std);
+
+    const out = xs.map((v, i) => {
+      const prev = (i > 0 ? xs[i-1] : 0);
+      const spike2x = (prev > 0 && v >= (prev * 2) && v >= 3);
+      return (v >= hard) || spike2x;
+    });
+
+    return {mask: out, threshold: hard};
+  }
+
+  function topSpikes(labels, arr, mask, limit){
+    const xs = (arr || []).map(v => Number(v || 0));
+    const items = [];
+    for (let i = 0; i < labels.length; i++){
+      if (!mask[i]) continue;
+      items.push({i, label: labels[i], v: xs[i]});
+    }
+    items.sort((a,b) => (b.v - a.v));
+    return items.slice(0, limit || 3);
+  }
+
+  function renderCallouts(elId, items, opts){
+    opts = opts || {};
+    const el = document.getElementById(elId);
+    if (!el) return;
+
+    el.innerHTML = "";
+    if (!items || !items.length) return;
+
+    for (const it of items){
+      const d = document.createElement("div");
+      d.className = "callout";
+      d.title = "Click to open audit log for this bucket";
+      d.addEventListener("click", () => openAuditForBucket(it.label, opts));
+
+      const ts = document.createElement("span");
+      ts.className = "ts";
+      ts.textContent = it.label;
+
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = String(it.v);
+
+      const desc = document.createElement("span");
+      desc.className = "desc";
+      desc.textContent = opts.desc || "spike";
+
+      d.appendChild(ts);
+      d.appendChild(badge);
+      d.appendChild(desc);
+      el.appendChild(d);
+    }
+  }
+
+  // Plugin: draw small "alert dots" on spike points (single dataset charts)
+  const SpikeDotsPlugin = {
+    id: "spikeDots",
+    afterDatasetsDraw(chart){
+      const meta = chart.getDatasetMeta(0);
+      if (!meta || !meta.data) return;
+
+      const opt = (chart.options.plugins && chart.options.plugins.spikeDots) || {};
+      const spikes = opt.spikes || [];
+      if (!spikes.length) return;
+
+      const ctx = chart.ctx;
+      ctx.save();
+      for (let i = 0; i < meta.data.length; i++){
+        if (!spikes[i]) continue;
+        const pt = meta.data[i];
+        if (!pt) continue;
+
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "rgba(239,68,68,.85)";
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 2.8, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(239,68,68,.85)";
+        ctx.fill();
       }
+      ctx.restore();
     }
+  };
 
-    const qs = params.toString();
-    const suffix = qs ? ("?" + qs) : "";
+  function buildCharts(data){
+    const labels = data.labels || [];
+    const s = (data.series || {});
+    const audit = (s.audit_volume || []);
+    const login = (s.login_failures || []);
+    const priv  = (s.privileged_actions || []);
 
-    const btnSeries = document.getElementById("btnExportSeries");
-    if (btnSeries) btnSeries.href = "/admin/export/dashboard_series.csv" + suffix;
+    const auditSpike = spikeMask(audit);
+    const loginSpike = spikeMask(login);
+    const privSpike  = spikeMask(priv);
 
-    const btnAudit = document.getElementById("btnExportAudit");
-    if (btnAudit) btnAudit.href = "/admin/export/audit.csv" + suffix;
+    // Callouts
+    renderCallouts("calloutsAudit", topSpikes(labels, audit, auditSpike.mask, 3), { desc: "audit spike" });
 
-    // "Open full window" buttons (respect selected window)
-    const btnAuditDrill = document.getElementById("btnAuditDrill");
-    const btnSignalsDrill = document.getElementById("btnSignalsDrill");
-    if (btnAuditDrill) btnAuditDrill.href = "/admin/audit" + suffix;
-    if (btnSignalsDrill) btnSignalsDrill.href = "/admin/audit" + suffix;
+    const sigItems = []
+      .concat(topSpikes(labels, login, loginSpike.mask, 3).map(x => ({...x, kind:"login"})))
+      .concat(topSpikes(labels, priv,  privSpike.mask,  3).map(x => ({...x, kind:"priv"})));
+    sigItems.sort((a,b) => (b.v - a.v));
+    renderCallouts("calloutsSignals", sigItems.slice(0, 4).map(x => ({i:x.i, label:x.label, v:x.v})), { desc: "signal spike" });
 
-    function isHourLabel(lbl){
-      return (lbl || "").length > 10; // "YYYY-MM-DD HH:00"
-    }
-    function bucketToIso(lbl, which){
-      // returns ISO Z timestamps for start/end of bucket
-      // hour: YYYY-MM-DD HH:00
-      // day: YYYY-MM-DD
-      const s = (lbl || "").trim();
-      if (!s) return "";
+    if (chartAudit) { chartAudit.destroy(); chartAudit = null; }
+    if (chartSignals) { chartSignals.destroy(); chartSignals = null; }
 
-      if (isHourLabel(s)){
-        const y = s.slice(0,4), m = s.slice(5,7), d = s.slice(8,10);
-        const hh = s.slice(11,13);
-        if (which === "start") return `${y}-${m}-${d}T${hh}:00:00Z`;
-        return `${y}-${m}-${d}T${hh}:59:59Z`;
-      } else {
-        // day bucket
-        if (which === "start") return `${s}T00:00:00Z`;
-        return `${s}T23:59:59Z`;
-      }
-    }
+    const elA = document.getElementById("chartAudit");
+    const elS = document.getElementById("chartSignals");
+    if (!elA || !elS) return;
 
-    function openAuditForBucket(lbl, opts){
-      opts = opts || {};
-      const start = bucketToIso(lbl, "start");
-      const end = bucketToIso(lbl, "end");
-      const u = new URL(window.location.origin + "/admin/audit");
-      if (start) u.searchParams.set("start_utc", start);
-      if (end) u.searchParams.set("end_utc", end);
-      // optionally constrain to an action
-      if (opts.event) u.searchParams.set("event", opts.event);
-      window.location.href = u.toString();
-    }
-
-    function stats(arr){
-      const xs = (arr || []).map(v => Number(v||0)).filter(v => Number.isFinite(v));
-      if (!xs.length) return {mean:0, std:0, max:0};
-      let sum = 0;
-      for (const v of xs) sum += v;
-      const mean = sum / xs.length;
-      let varsum = 0;
-      for (const v of xs) varsum += (v - mean) * (v - mean);
-      const std = Math.sqrt(varsum / xs.length);
-      let max = 0;
-      for (const v of xs) if (v > max) max = v;
-      return {mean, std, max};
-    }
-
-    function spikeMask(arr){
-      // flags: value >= max(3, mean + 2*std) OR > previous*2 and >= 3
-      const xs = (arr || []).map(v => Number(v||0));
-      const st = stats(xs);
-      const hard = Math.max(3, st.mean + 2*st.std);
-      const out = xs.map((v, i) => {
-        const prev = (i > 0 ? xs[i-1] : 0);
-        const spike2x = (prev > 0 && v >= (prev * 2) && v >= 3);
-        return (v >= hard) || spike2x;
-      });
-      return {mask: out, threshold: hard};
-    }
-
-    function topSpikes(labels, arr, mask, limit){
-      const xs = (arr || []).map(v => Number(v||0));
-      const items = [];
-      for (let i=0; i<labels.length; i++){
-        if (!mask[i]) continue;
-        items.push({i, label: labels[i], v: xs[i]});
-      }
-      items.sort((a,b) => (b.v - a.v));
-      return items.slice(0, limit || 3);
-    }
-
-    function renderCallouts(elId, items, opts){
-      opts = opts || {};
-      const el = document.getElementById(elId);
-      if (!el) return;
-      el.innerHTML = "";
-
-      if (!items || !items.length) {
-        // keep it subtle: show nothing if no spikes
-        return;
-      }
-
-      for (const it of items){
-        const d = document.createElement("div");
-        d.className = "callout";
-        d.title = "Click to open audit log for this bucket";
-        d.addEventListener("click", () => openAuditForBucket(it.label, opts));
-
-        const ts = document.createElement("span");
-        ts.className = "ts";
-        ts.textContent = it.label;
-
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = String(it.v);
-
-        const desc = document.createElement("span");
-        desc.className = "desc";
-        desc.textContent = opts.desc || "spike";
-
-        d.appendChild(ts);
-        d.appendChild(badge);
-        d.appendChild(desc);
-        el.appendChild(d);
-      }
-    }
-
-    // Plugin: draw small "alert dots" on spike points
-    const SpikeDotsPlugin = {
-      id: "spikeDots",
-      afterDatasetsDraw(chart, args, pluginOptions){
-        const meta = chart.getDatasetMeta(0);
-        if (!meta || !meta.data) return;
-
-        const spikes = (pluginOptions && pluginOptions.spikes) || [];
-        if (!spikes.length) return;
-
-        const ctx = chart.ctx;
-        ctx.save();
-        for (let i=0; i<meta.data.length; i++){
-          if (!spikes[i]) continue;
-          const pt = meta.data[i];
-          if (!pt) continue;
-          const x = pt.x, y = pt.y;
-          // draw a small ring (no hard-coded colors elsewhere; this is minimal)
-          ctx.beginPath();
-          ctx.arc(x, y, 6, 0, Math.PI*2);
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = "rgba(239,68,68,.85)";
-          ctx.stroke();
-
-          ctx.beginPath();
-          ctx.arc(x, y, 2.8, 0, Math.PI*2);
-          ctx.fillStyle = "rgba(239,68,68,.85)";
-          ctx.fill();
+    chartAudit = new Chart(elA.getContext("2d"), {
+      type: "line",
+      data: {
+        labels,
+        datasets: [{
+          label: "Audit events",
+          data: audit,
+          tension: 0.25,
+          pointRadius: 3,
+          pointHoverRadius: 6
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          spikeDots: { spikes: auditSpike.mask },
+          tooltip: {
+            callbacks: {
+              afterBody: function(){
+                return ["Click to view events for this bucket"];
+              }
+            }
+          }
+        },
+        onHover: (evt, activeEls) => {
+          const canvas = evt?.native?.target;
+          if (!canvas) return;
+          canvas.style.cursor = (activeEls && activeEls.length) ? "pointer" : "default";
+        },
+        onClick: (evt, activeEls) => {
+          if (!activeEls || !activeEls.length) return;
+          const idx = activeEls[0].index;
+          openAuditForBucket(labels[idx], {});
         }
+      },
+      plugins: [SpikeDotsPlugin]
+    });
+
+    chartSignals = new Chart(elS.getContext("2d"), {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          { label: "Login failures", data: login, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 },
+          { label: "Privileged actions", data: priv, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          tooltip: {
+            callbacks: {
+              afterBody: function(ctx){
+                const lines = ["Click to view events for this bucket"];
+                const loginItem = (ctx || []).find(it => it.datasetIndex === 0);
+                const hasLogin = loginItem && Number(loginItem.raw || 0) > 0;
+                if (hasLogin) lines.push("Tip: filter action=login_attempt to inspect auth activity");
+                return lines;
+              }
+            }
+          }
+        },
+        onHover: (evt, activeEls) => {
+          const canvas = evt?.native?.target;
+          if (!canvas) return;
+          canvas.style.cursor = (activeEls && activeEls.length) ? "pointer" : "default";
+        },
+        onClick: (evt, activeEls) => {
+          if (!activeEls || !activeEls.length) return;
+          const idx = activeEls[0].index;
+          const dsIndex = activeEls[0].datasetIndex;
+          const lbl = labels[idx];
+          if (dsIndex === 0) openAuditForBucket(lbl, { event: "login_attempt" });
+          else openAuditForBucket(lbl, {});
+        }
+      }
+    });
+
+    // spike dots for the 2-dataset chartSignals
+    chartSignals.config.plugins = chartSignals.config.plugins || [];
+    chartSignals.config.plugins.push({
+      id: "spikeDotsSignals",
+      afterDatasetsDraw(chart){
+        const ctx = chart.ctx;
+        const ds0 = chart.getDatasetMeta(0);
+        const ds1 = chart.getDatasetMeta(1);
+        const s0 = loginSpike.mask || [];
+        const s1 = privSpike.mask  || [];
+
+        ctx.save();
+
+        function draw(meta, spikes, color){
+          if (!meta || !meta.data) return;
+          for (let i = 0; i < meta.data.length; i++){
+            if (!spikes[i]) continue;
+            const pt = meta.data[i];
+            if (!pt) continue;
+
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, 6, 0, Math.PI*2);
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = color;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, 2.8, 0, Math.PI*2);
+            ctx.fillStyle = color;
+            ctx.fill();
+          }
+        }
+
+        draw(ds0, s0, "rgba(239,68,68,.85)");
+        draw(ds1, s1, "rgba(245,158,11,.85)");
+
         ctx.restore();
       }
-    };
+    });
+    chartSignals.update();
+  }
 
-    function buildCharts(data){
-      const labels = data.labels || [];
-      const s = (data.series || {});
-      const audit = (s.audit_volume || []);
-      const login = (s.login_failures || []);
-      const priv = (s.privileged_actions || []);
+  fetch("/admin/api/dashboard/series?" + params.toString(), {
+    credentials: "same-origin",
+    cache: "no-store"
+  })
+    .then(r => r.json())
+    .then(data => buildCharts(data))
+    .catch(err => console.error("dashboard series fetch failed", err));
+})();
 
-      const auditSpike = spikeMask(audit);
-      const loginSpike = spikeMask(login);
-      const privSpike = spikeMask(priv);
-
-      // Callouts (top spikes only)
-      renderCallouts("calloutsAudit", topSpikes(labels, audit, auditSpike.mask, 3), { desc: "audit spike" });
-      // Signals: prioritize login spikes, then privileged spikes
-      const sigItems = []
-        .concat(topSpikes(labels, login, loginSpike.mask, 3).map(x => ({...x, kind:"login"})))
-        .concat(topSpikes(labels, priv, privSpike.mask, 3).map(x => ({...x, kind:"priv"})));
-      sigItems.sort((a,b) => (b.v - a.v));
-      renderCallouts("calloutsSignals", sigItems.slice(0, 4).map(x => {
-        return { i:x.i, label:x.label, v:x.v };
-      }), { desc: "signal spike" });
-
-      if (chartAudit) { chartAudit.destroy(); chartAudit = null; }
-      if (chartSignals) { chartSignals.destroy(); chartSignals = null; }
-
-      const ctxA = document.getElementById("chartAudit").getContext("2d");
-      chartAudit = new Chart(ctxA, {
-        type: "line",
-        data: {
-          labels,
-          datasets: [{
-            label: "Audit events",
-            data: audit,
-            tension: 0.25,
-            pointRadius: 3,
-            pointHoverRadius: 6
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          interaction: { mode: "index", intersect: false },
-          plugins: {
-            tooltip: {
-              callbacks: {
-                afterBody: function(){
-                  return ["Click to view events for this bucket"];
-                }
-              }
-            }
-          },
-          onHover: (evt, activeEls) => {
-            const canvas = evt?.native?.target;
-            if (!canvas) return;
-            canvas.style.cursor = activeEls && activeEls.length ? "pointer" : "default";
-          },
-          onClick: (evt, activeEls) => {
-            if (!activeEls || !activeEls.length) return;
-            const idx = activeEls[0].index;
-            const lbl = labels[idx];
-            openAuditForBucket(lbl, {});
-          }
-        },
-        plugins: [SpikeDotsPlugin],
-        pluginOptions: { spikeDots: { spikes: auditSpike.mask } }
-      });
-
-      // Chart.js doesn't pass pluginOptions like that; set on chart instance for our plugin:
-      chartAudit.options.plugins.spikeDots = { spikes: auditSpike.mask };
-
-      const ctxS = document.getElementById("chartSignals").getContext("2d");
-      chartSignals = new Chart(ctxS, {
-        type: "line",
-        data: {
-          labels,
-          datasets: [
-            { label: "Login failures", data: login, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 },
-            { label: "Privileged actions", data: priv, tension: 0.25, pointRadius: 3, pointHoverRadius: 6 }
-          ]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          interaction: { mode: "index", intersect: false },
-          plugins: {
-            tooltip: {
-              callbacks: {
-                afterBody: function(ctx){
-                  // ctx = array of tooltip items (one per dataset)
-                  const lines = ["Click to view events for this bucket"];
-                  // helpful hint if login failures are present
-                  const hasLogin = ctx && ctx.length ? (ctx[0].label && true) : false;
-                  if (hasLogin) lines.push("Tip: filter action=login_attempt to inspect auth activity");
-                  return lines;
-                }
-              }
-            }
-          },
-          onHover: (evt, activeEls) => {
-            const canvas = evt?.native?.target;
-            if (!canvas) return;
-            canvas.style.cursor = activeEls && activeEls.length ? "pointer" : "default";
-          },
-          onClick: (evt, activeEls) => {
-            if (!activeEls || !activeEls.length) return;
-            const idx = activeEls[0].index;
-            const dsIndex = activeEls[0].datasetIndex;
-            const lbl = labels[idx];
-
-            // If they click the login series, jump with event filter (action name).
-            if (dsIndex === 0) {
-              openAuditForBucket(lbl, { event: "login_attempt" });
-            } else {
-              openAuditForBucket(lbl, {});
-            }
-          }
-        }
-      });
-
-      // draw spike dots on both datasets by layering two plugin instances (simple + robust)
-      chartSignals.config.plugins = chartSignals.config.plugins || [];
-      chartSignals.config.plugins.push({
-        id: "spikeDotsSignals",
-        afterDatasetsDraw(chart){
-          const ctx = chart.ctx;
-          const ds0 = chart.getDatasetMeta(0);
-          const ds1 = chart.getDatasetMeta(1);
-          const s0 = loginSpike.mask || [];
-          const s1 = privSpike.mask || [];
-          ctx.save();
-
-          function draw(meta, spikes, color){
-            if (!meta || !meta.data) return;
-            for (let i=0; i<meta.data.length; i++){
-              if (!spikes[i]) continue;
-              const pt = meta.data[i];
-              if (!pt) continue;
-              ctx.beginPath();
-              ctx.arc(pt.x, pt.y, 6, 0, Math.PI*2);
-              ctx.lineWidth = 2;
-              ctx.strokeStyle = color;
-              ctx.stroke();
-              ctx.beginPath();
-              ctx.arc(pt.x, pt.y, 2.8, 0, Math.PI*2);
-              ctx.fillStyle = color;
-              ctx.fill();
-            }
-          }
-
-          draw(ds0, s0, "rgba(239,68,68,.85)"); // login spikes
-          draw(ds1, s1, "rgba(245,158,11,.85)"); // privileged spikes
-
-          ctx.restore();
-        }
-      });
-      chartSignals.update();
-    }
-
-    fetch("/admin/api/dashboard/series?" + params.toString(), {
-      credentials: "same-origin",
-      cache: "no-store"
-    })
-      .then(r => r.json())
-      .then(data => buildCharts(data))
-      .catch(err => console.error("dashboard series fetch failed", err));
-  })();
-
-  (function(){
+(function(){
   const qs = window.location.search || ""; // carries w/from/to
   const STORAGE_KEYS = {
     storyStatus: "admin_story_status_mode",
@@ -1120,11 +1201,167 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
   let chartStatus = null;
   let chartAsg = null;
 
+  const modal = document.getElementById("drillModal");
+  const backdrop = document.getElementById("drillBackdrop");
+  const btnClose = document.getElementById("drillClose");
+  const btnPrev = document.getElementById("drillPrev");
+  const btnNext = document.getElementById("drillNext");
+  const titleEl = document.getElementById("drillTitle");
+  const subEl = document.getElementById("drillSub");
+  const bodyEl = document.getElementById("drillBody");
+
+  let drillState = { kind:null, value:null, mode:null, limit:50, offset:0, total:null };
+
+  function esc(s){
+    return String(s || "").replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+
+  function showModal(){ if (modal) modal.style.display = "block"; }
+  function hideModal(){ if (modal) modal.style.display = "none"; }
+
+  if (backdrop) backdrop.addEventListener("click", hideModal);
+  if (btnClose) btnClose.addEventListener("click", hideModal);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideModal(); });
+
+  function renderRows(rows){
+    if (!bodyEl) return;
+
+    if (!rows || !rows.length){
+      bodyEl.innerHTML = `<tr><td colspan="4" style="padding:14px 8px; color:rgba(250,250,250,.75);">No stories found.</td></tr>`;
+      return;
+    }
+
+    bodyEl.innerHTML = rows.map(r => {
+      const title = esc(r.title || "(untitled)");
+      const storyId = String(r.story_id || "");
+      const href = storyId ? ("/story/" + encodeURIComponent(storyId)) : "";
+
+      const titleCell = href
+        ? `<a href="${esc(href)}" target="_blank" rel="noopener" style="color:rgba(147,197,253,.95); font-weight:850; text-decoration:none;">${title}</a>`
+        : `<span style="font-weight:850;">${title}</span>`;
+
+      const status = esc(r.status || "");
+      const assignee = esc(r.assignee || "");
+      const updated = esc(r.updated_at || "");
+
+      return `
+        <tr>
+          <td style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06);">${titleCell}</td>
+          <td style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06);">${status}</td>
+          <td style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06);">${assignee}</td>
+          <td style="padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.06);">${updated}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+
+  function setPagerButtons(rowsLen){
+    const total = (typeof drillState.total === "number") ? drillState.total : null;
+
+    // Prev: disabled only at offset 0
+    if (btnPrev) btnPrev.disabled = (drillState.offset <= 0);
+
+    // Next:
+    // If we know total, disable when offset+limit >= total.
+    // If total unknown (older backend), fall back to rowsLen < limit.
+    if (btnNext) {
+      if (total !== null && Number.isFinite(total)) {
+        btnNext.disabled = (drillState.offset + drillState.limit >= total);
+      } else {
+        btnNext.disabled = (rowsLen < drillState.limit);
+      }
+    }
+  }
+
+
+    function drillFetch(){
+    const p = new URLSearchParams(window.location.search);
+
+    p.set("kind", drillState.kind);
+    p.set("value", drillState.value);
+    p.set("mode", drillState.mode);
+    p.set("limit", String(drillState.limit));
+    p.set("offset", String(drillState.offset));
+
+    // ✅ Build a real absolute URL (Safari-safe)
+    const u = new URL("/admin/api/story_drilldown", window.location.origin);
+    u.search = p.toString();
+
+    return fetch(u.toString(), { credentials:"same-origin", cache:"no-store" })
+      .then(async (r) => {
+        // ✅ If backend returns HTML (redirect/login/500), show it clearly
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(`HTTP ${r.status}: ${t.slice(0, 180)}`);
+        }
+        return r.json();
+      })
+      .then(data => {
+        if (!data || !data.ok) throw new Error((data && data.error) || "drilldown failed");
+
+        if (titleEl) titleEl.textContent = `Stories by ${drillState.kind}: ${drillState.value}`;
+
+          const rows = data.rows || [];
+          const total = Number(data.total || 0);
+          drillState.total = Number.isFinite(total) ? total : null;
+
+
+          const startN = total ? (drillState.offset + 1) : 0;
+          const endN = total ? Math.min(drillState.offset + rows.length, total) : rows.length;
+
+          renderRows(rows);
+          setPagerButtons(rows.length);
+
+          if (subEl) {
+            const w = (new URLSearchParams(window.location.search).get("w") || "24h");
+            const modeLine = (drillState.mode === "windowed") ? `Mode: windowed (${w})` : `Mode: snapshot`;
+            const rangeLine = total ? `Showing ${startN}–${endN} of ${total}` : `Showing ${rows.length}`;
+            subEl.textContent = `${modeLine} · ${rangeLine}`;
+          }
+
+          showModal();
+
+      })
+      .catch(err => {
+        if (bodyEl) bodyEl.innerHTML =
+          `<tr><td colspan="4" style="padding:14px 8px; color:rgba(250,250,250,.85);">Error: ${esc(err.message)}</td></tr>`;
+        showModal();
+      });
+  }
+
+
+    if (btnPrev) btnPrev.addEventListener("click", () => { drillState.offset = Math.max(0, drillState.offset - drillState.limit); drillFetch(); });
+    if (btnNext) btnNext.addEventListener("click", () => {
+      const total = (typeof drillState.total === "number") ? drillState.total : null;
+      const nextOffset = drillState.offset + drillState.limit;
+
+      if (total !== null && Number.isFinite(total)) {
+        if (nextOffset >= total) return; // already at end
+      }
+
+      drillState.offset = nextOffset;
+      drillFetch();
+    });
+
+
+  function openDrilldown(kind, value, mode){
+    drillState.kind = kind;
+    drillState.value = value;
+    drillState.mode = mode;  // "snapshot" or "windowed"
+    drillState.offset = 0;
+    drillState.total = null; // reset so buttons don't use stale totals
+    drillFetch();
+  }
+
+
+
   function renderStoryCharts(payload){
     const modeStatus = getMode("storyStatus", "windowed");
     const modeAsg = getMode("assignments", "snapshot");
 
-    // Update UI
     document.querySelectorAll('.seg[data-toggle="storyStatus"]').forEach(seg => setSegActive(seg, modeStatus));
     document.querySelectorAll('.seg[data-toggle="assignments"]').forEach(seg => setSegActive(seg, modeAsg));
 
@@ -1152,6 +1389,7 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     if (elStatus) {
       const ctx = elStatus.getContext("2d");
       if (chartStatus) chartStatus.destroy();
+
       chartStatus = new Chart(ctx, {
         type: "doughnut",
         data: {
@@ -1201,14 +1439,19 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
         }
       });
 
-      // Optional "interactive": click slice => toggle visibility (no routing assumptions)
+      // TEMP: until stories drilldown endpoint exists
       elStatus.onclick = (evt) => {
         const points = chartStatus.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, true);
         if (!points.length) return;
+
         const idx = points[0].index;
-        chartStatus.toggleDataVisibility(idx);
-        chartStatus.update();
+        const status = (stLabels[idx] || "").trim();
+        if (!status) return;
+
+        const modeStatus = getMode("storyStatus", "windowed");
+        openDrilldown("status", status, modeStatus);
       };
+
     }
 
     // ---- assignments bar ----
@@ -1230,6 +1473,7 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
     if (elAsg) {
       const ctx = elAsg.getContext("2d");
       if (chartAsg) chartAsg.destroy();
+
       chartAsg = new Chart(ctx, {
         type: "bar",
         data: {
@@ -1273,16 +1517,19 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
         }
       });
 
-      // Optional "interactive": click bar => highlight only that bar (simple, no routes)
+      // TEMP: until stories drilldown endpoint exists
       elAsg.onclick = (evt) => {
         const points = chartAsg.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, true);
         if (!points.length) return;
+
         const idx = points[0].index;
-        const meta = chartAsg.getDatasetMeta(0);
-        meta.data.forEach((bar, i) => bar.hidden = (i !== idx) ? true : false);
-        chartAsg.update();
-        // click again anywhere empty to reset
+        const assignee = (asg[idx] && asg[idx].assignee) ? String(asg[idx].assignee) : "";
+        if (!assignee) return;
+
+        const modeAsg = getMode("assignments", "snapshot");
+        openDrilldown("assignee", assignee, modeAsg);
       };
+
     }
   }
 
@@ -1303,60 +1550,11 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
   fetch("/admin/api/story_kpis" + qs, { credentials: "same-origin", cache: "no-store" })
     .then(r => r.json())
     .then(data => {
-      // data has {snapshot, windowed, meta}
       wireSegToggles(data);
       renderStoryCharts(data);
     })
     .catch(err => console.error("story KPI fetch failed", err));
 })();
+</script>
 
-
-  </script>
-
-    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
-      <div class="kpi-card">
-        <div class="kpi-head">
-          <div class="kpi-label">Story status distribution</div>
-          <span class="tip" tabindex="0" data-tip="Snapshot = current statuses. Windowed = stories touched (updated) in the selected time range.">i</span>
-        </div>
-
-        <!-- toggle header OUTSIDE chart-wrap -->
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
-          <div style="font-weight:950;">Story status</div>
-          <div class="seg" data-toggle="storyStatus">
-            <a href="#" data-mode="windowed">Windowed</a>
-            <a href="#" data-mode="snapshot">Snapshot</a>
-          </div>
-        </div>
-
-        <div class="chart-wrap" style="height:260px; margin-top:10px;">
-          <canvas id="chartStoryStatus"></canvas>
-        </div>
-      </div>
-
-      <div class="kpi-card">
-        <div class="kpi-head">
-          <div class="kpi-label">Assigned stories per user</div>
-          <span class="tip" tabindex="0" data-tip="Snapshot = current assignments. Windowed = activity in range grouped by assignee.">i</span>
-        </div>
-
-        <!-- toggle header OUTSIDE chart-wrap -->
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
-          <div style="font-weight:950;">Assigned stories</div>
-          <div class="seg" data-toggle="assignments">
-            <a href="#" data-mode="snapshot">Snapshot</a>
-            <a href="#" data-mode="windowed">Windowed</a>
-          </div>
-        </div>
-
-        <div class="chart-wrap" style="height:260px; margin-top:10px;">
-          <canvas id="chartAssignments"></canvas>
-        </div>
-      </div>
-    </div>
-
-    <div class="muted" style="margin-top:10px;">
-      Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
-    </div>
-  </div>
 """

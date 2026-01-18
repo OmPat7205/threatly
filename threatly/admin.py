@@ -11,12 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 from flask import Blueprint, Response, abort, redirect, render_template_string, request, url_for,jsonify
-from threatly.state_db import (
-    get_story_status_counts,
-    get_story_assignment_counts,
-    get_story_status_counts_window,
-    get_story_assignment_counts_window,
-)
+
+
 
 
 from threatly.config import STATE_DB_PATH, WATCHLIST_PATH
@@ -25,6 +21,11 @@ from threatly.state_db import (
     create_user,
     ensure_admin_audit_table,
     get_admin_audit_kpis,
+    get_story_status_counts,
+    get_story_assignment_counts,
+    get_story_status_counts_window,
+    get_story_assignment_counts_window,
+    story_drilldown,
     get_user_by_email,
     list_audit_events,
     list_users,
@@ -33,6 +34,8 @@ from threatly.state_db import (
     toggle_user_active,
     write_audit_event as write_admin_audit_event,
 )
+
+
 from threatly.templates import TEMPLATES
 
 
@@ -223,8 +226,8 @@ def _top_action_context(*, tenant_id: str, start_utc: str, end_utc: str, action:
 # DB helpers (admin-only tables)
 # -----------------------------
 def _db() -> sqlite3.Connection:
-    import os
-    conn = sqlite3.connect(STATE_DB_PATH)
+    # Match threatly.state_db.db_connect behavior: timeout + autocommit (isolation_level=None)
+    conn = sqlite3.connect(STATE_DB_PATH, timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON;")
     try:
@@ -233,6 +236,7 @@ def _db() -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
 
 
 
@@ -842,87 +846,13 @@ def admin_home():
     disabled = total - active
     admins = sum(1 for u in users if (u.get("role") or "") == "admin")
 
-    # ---- helpers ----
-    def _parse_date_yyyy_mm_dd(s: str) -> Optional[datetime]:
-        """
-        Parse HTML <input type="date"> value: YYYY-MM-DD
-        Returns naive datetime at 00:00:00 if valid else None.
-        """
-        try:
-            s = (s or "").strip()
-            if not s:
-                return None
-            return datetime.strptime(s, "%Y-%m-%d")
-        except Exception:
-            return None
-    def _q(name: str, default: str = "") -> str:
-        vals = request.args.getlist(name)
-        return (vals[-1] if vals else default).strip()
-
     # ---- time window selection (query params) ----
-    w = _q("w", "24h").lower()
-    raw_from = _q("from", "")
-    raw_to = _q("to", "")
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket = _compute_window_from_request(request.args)
 
-
-    now = _utcnow()
-
-    # defaults
-    start_dt = now - timedelta(days=1)
-    end_dt = now
+    # For UI form fields (keep whatever user typed; your helper already does this)
     clean_from = raw_from
     clean_to = raw_to
 
-    if w == "7d":
-        start_dt = now - timedelta(days=7)
-        end_dt = now
-
-    elif w == "30d":
-        start_dt = now - timedelta(days=30)
-        end_dt = now
-
-    elif w == "90d":
-        start_dt = now - timedelta(days=90)
-        end_dt = now
-
-   
-    elif w == "custom":
-        d_from = _parse_date_yyyy_mm_dd(raw_from)
-        d_to = _parse_date_yyyy_mm_dd(raw_to)
-
-        # Stay in custom mode even if dates are missing/invalid
-        if d_from and d_to:
-            start_dt = d_from
-            end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
-
-            # if user flipped them, swap
-            if end_dt < start_dt:
-                start_dt, end_dt = end_dt, start_dt
-
-            # Clamp future end dates (e.g., selecting "today") to now
-            if end_dt > now:
-                end_dt = now
-        else:
-            # keep UI in Custom, but show last 24h data until user selects dates
-            start_dt = now - timedelta(days=1)
-            end_dt = now
-            clean_from = raw_from if d_from else ""
-            clean_to = raw_to if d_to else ""
-
-
-    else:
-        # any unknown window -> 24h
-        w = "24h"
-        start_dt = now - timedelta(days=1)
-        end_dt = now
-        clean_from = ""
-        clean_to = ""
-
-
-
-    # Normalize to ISO strings (consistent with created_utc storage)
-    start_iso = _iso_z(start_dt)
-    end_iso = _iso_z(end_dt)
 
 
     # ---- audit KPIs windowed ----
@@ -932,7 +862,7 @@ def admin_home():
         end_utc=end_iso,
         top_n=10,
     ) or {}
-    print("audit_kpis:", audit_kpis)
+
 
 
     # ---- previous-window comparison (same duration) ----
@@ -998,6 +928,12 @@ def admin_home():
             "end_utc": end_iso,
         },
         kpis={
+
+            # Back-compat aliases (if template expects old names)
+            "audit_24h": int(audit_kpis.get("audit_window", 0)),
+            "privileged_24h": int(audit_kpis.get("privileged_window", 0)),
+            "login_fail_24h": int(audit_kpis.get("login_fail_window", 0)),
+
             # state KPIs (all-time)
             "total_users": total,
             "active_users": active,
@@ -1131,60 +1067,8 @@ def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, buc
 def admin_dashboard_series():
     ensure_admin_tables()
 
-    def _q(name: str, default: str = "") -> str:
-        vals = request.args.getlist(name)
-        return (vals[-1] if vals else default).strip()
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket = _compute_window_from_request(request.args)
 
-    w = _q("w", "24h").lower()
-    raw_from = _q("from", "")
-    raw_to = _q("to", "")
-
-
-    now = _utcnow()
-    start_dt = now - timedelta(days=1)
-    end_dt = now
-
-    def _parse_date(s: str) -> Optional[datetime]:
-        try:
-            return datetime.strptime((s or "").strip(), "%Y-%m-%d")
-        except Exception:
-            return None
-
-    if w == "7d":
-        start_dt = now - timedelta(days=7)
-    elif w == "30d":
-        start_dt = now - timedelta(days=30)
-    elif w == "90d":
-        start_dt = now - timedelta(days=90)
-
-    elif w == "custom":
-        d_from = _parse_date(raw_from)
-        d_to = _parse_date(raw_to)
-
-        # Stay in custom even if dates are missing.
-        if d_from and d_to:
-            start_dt = d_from
-            end_dt = d_to + timedelta(days=1) - timedelta(seconds=1)
-
-            # If user flipped them, swap (match admin_home behavior)
-            if end_dt < start_dt:
-                start_dt, end_dt = end_dt, start_dt
-
-            # Clamp future end dates (e.g., selecting "today") to now
-            if end_dt > now:
-                end_dt = now
-        else:
-            start_dt = now - timedelta(days=1)
-            end_dt = now
-
-
-
-
-    start_iso = _iso_z(start_dt)
-    end_iso = _iso_z(end_dt)
-
-
-    bucket = "hour" if (end_dt - start_dt) <= timedelta(days=2) else "day"
 
     data = _query_dashboard_series(
         tenant_id=TENANT_ID_DEFAULT,
@@ -2102,5 +1986,66 @@ def admin_story_kpis():
             "assignments": win_assign,
         },
     })
+
+@admin_bp.get("/api/story_drilldown")
+@require_perm("view_admin")  # if your perm name differs, use whatever you use on other admin api routes
+def api_story_drilldown():
+    """
+    Returns a paginated list of stories behind a chart slice/bar.
+
+    Query params:
+      - kind: "status" | "assignee"
+      - value: the status string or the assignee string (email)
+      - mode: "snapshot" | "windowed"  (windowed applies time filter)
+      - w/from/to: same as dashboard (optional; passed through)
+      - start_utc/end_utc: optional explicit ISO Z bounds (if you prefer)
+      - limit, offset: pagination
+    """
+    kind = (request.args.get("kind") or "").strip().lower()
+    value = (request.args.get("value") or "").strip()
+    mode = (request.args.get("mode") or "snapshot").strip().lower()
+
+    if kind not in ("status", "assignee"):
+        return jsonify({"ok": False, "error": "invalid kind"}), 400
+    if not value:
+        return jsonify({"ok": False, "error": "missing value"}), 400
+    if mode not in ("snapshot", "windowed"):
+        mode = "snapshot"
+
+    # window handling: reuse the same logic as the dashboard
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, bucket = _compute_window_from_request(request.args)
+
+    limit = int(request.args.get("limit") or 50)
+    offset = int(request.args.get("offset") or 0)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    result = story_drilldown(
+        kind=kind,
+        value=value,
+        mode=mode,
+        start_utc=(start_iso if mode == "windowed" else None),
+        end_utc=(end_iso if mode == "windowed" else None),
+        limit=limit,
+        offset=offset,
+    ) or {}
+
+    rows = result.get("rows") or []
+    total = int(result.get("total") or 0)
+
+    return jsonify({
+        "ok": True,
+        "kind": kind,
+        "value": value,
+        "mode": mode,
+        "start_utc": start_iso if mode == "windowed" else None,
+        "end_utc": end_iso if mode == "windowed" else None,
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+        "rows": rows,
+    })
+
+
 
 

@@ -11,7 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 from flask import Blueprint, Response, abort, redirect, render_template_string, request, url_for,jsonify
-from threatly.state_db import get_story_status_counts, get_story_assignment_counts
+from threatly.state_db import (
+    get_story_status_counts,
+    get_story_assignment_counts,
+    get_story_status_counts_window,
+    get_story_assignment_counts_window,
+)
+
 
 from threatly.config import STATE_DB_PATH, WATCHLIST_PATH
 from threatly.rbac import require_perm, has_perm
@@ -217,16 +223,17 @@ def _top_action_context(*, tenant_id: str, start_utc: str, end_utc: str, action:
 # DB helpers (admin-only tables)
 # -----------------------------
 def _db() -> sqlite3.Connection:
+    import os
     conn = sqlite3.connect(STATE_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON;")
-    # Optional quality-of-life for concurrency
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
     except Exception:
         pass
     return conn
+
 
 
 def ensure_admin_tables() -> None:
@@ -913,12 +920,6 @@ def admin_home():
 
 
 
-
-
-
-
-
-
     # Normalize to ISO strings (consistent with created_utc storage)
     start_iso = _iso_z(start_dt)
     end_iso = _iso_z(end_dt)
@@ -931,6 +932,7 @@ def admin_home():
         end_utc=end_iso,
         top_n=10,
     ) or {}
+    print("audit_kpis:", audit_kpis)
 
 
     # ---- previous-window comparison (same duration) ----
@@ -947,6 +949,8 @@ def admin_home():
         top_n=10,
     )
     audit_prev = audit_prev or {}
+
+    
 
 
     # ---- deltas + risk levels for key window KPIs ----
@@ -2052,20 +2056,51 @@ def admin_settings_watchlist_rollback(version_id: str):
 @require_perm("view_admin")
 def admin_story_kpis():
     ensure_admin_tables()
-    # global snapshot
-    status = get_story_status_counts(tenant_id=TENANT_ID_DEFAULT)
-    assignments = get_story_assignment_counts(tenant_id=TENANT_ID_DEFAULT, top_n=12)
 
-    # normalize to a stable status order (optional, nice UI)
-    status_order = ["New", "In Progress", "On Hold", "Escalated", "Closed"]
-    status_out = [{"status": s, "n": int(status.get(s, 0))} for s in status_order]
-    # include any unknown statuses at the end
-    for k, v in status.items():
-        if k not in status_order:
-            status_out.append({"status": k, "n": int(v)})
+    # Use the same window param behavior as your exports (supports 15m/1h/24h/7d/30d/90d/custom)
+    w, raw_from, raw_to, start_dt, end_dt, start_iso, end_iso, _bucket = _compute_window_from_request(request.args)
+
+    # --- SNAPSHOT (current state) ---
+    snap_status = get_story_status_counts(tenant_id=TENANT_ID_DEFAULT)
+    snap_assign = get_story_assignment_counts(tenant_id=TENANT_ID_DEFAULT, top_n=12)
+
+    # --- WINDOWED (activity in window) ---
+    win_status = get_story_status_counts_window(
+        tenant_id=TENANT_ID_DEFAULT,
+        start_utc=start_iso,
+        end_utc=end_iso,
+    )
+    win_assign = get_story_assignment_counts_window(
+        tenant_id=TENANT_ID_DEFAULT,
+        start_utc=start_iso,
+        end_utc=end_iso,
+        top_n=12,
+    )
+
+    def _order_status(d: Dict[str, int]) -> List[Dict[str, Any]]:
+        status_order = ["New", "In Progress", "On Hold", "Escalated", "Closed"]
+        out = [{"status": s, "n": int(d.get(s, 0))} for s in status_order]
+        for k, v in d.items():
+            if k not in status_order:
+                out.append({"status": str(k), "n": int(v)})
+        return out
 
     return jsonify({
-        "status": status_out,
-        "assignments": assignments,
+        "meta": {
+            "w": w,
+            "from": raw_from,
+            "to": raw_to,
+            "start_utc": start_iso,
+            "end_utc": end_iso,
+        },
+        "snapshot": {
+            "status": _order_status(snap_status),
+            "assignments": snap_assign,
+        },
+        "windowed": {
+            "status": _order_status(win_status),
+            "assignments": win_assign,
+        },
     })
+
 

@@ -16,8 +16,8 @@ from .config import STATE_DB_PATH, STATUS_VALUES
 # CORE DB UTIL
 # =============================
 def now_utc() -> datetime:
-    # Naive UTC (matches your stored ISO strings: datetime.utcnow().isoformat())
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
+
 
 
 def db_connect() -> sqlite3.Connection:
@@ -917,6 +917,165 @@ def get_memory_map(fingerprints: List[str], tenant_id: str = "default") -> Dict[
     finally:
         conn.close()
 
+# =============================
+# STORY KPI HELPERS (status + assignment)
+# =============================
+def get_story_status_counts(
+    *,
+    tenant_id: str = "default",
+    owner: str = "",  # if set -> filter to this owner (user-scoped)
+) -> Dict[str, int]:
+    """
+    Returns counts by status from story_meta.
+    If owner is provided, filters to that owner.
+    """
+    conn = db_connect()
+    try:
+        where = ["tenant_id = ?"]
+        params: List[Any] = [tenant_id]
+
+        if owner.strip():
+            where.append("COALESCE(owner,'') = ?")
+            params.append(owner.strip())
+
+        rows = conn.execute(
+            f"""
+            SELECT status, COUNT(1) AS n
+            FROM story_meta
+            WHERE {" AND ".join(where)}
+            GROUP BY status
+            """,
+            params,
+        ).fetchall()
+
+        out: Dict[str, int] = {}
+        for r in rows:
+            out[str(r["status"] or "New")] = int(r["n"] or 0)
+        return out
+    finally:
+        conn.close()
+
+
+def get_story_assignment_counts(
+    *,
+    tenant_id: str = "default",
+    top_n: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Returns counts by owner (assignee). Includes 'Unassigned'.
+    This is current workload (current story_meta state).
+    """
+    top_n = max(1, min(int(top_n or 12), 50))
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+              CASE WHEN COALESCE(owner,'') = '' THEN 'Unassigned' ELSE owner END AS assignee,
+              COUNT(1) AS n
+            FROM story_meta
+            WHERE tenant_id = ?
+            GROUP BY assignee
+            ORDER BY n DESC, assignee ASC
+            LIMIT ?
+            """,
+            (tenant_id, top_n),
+        ).fetchall()
+
+        return [{"assignee": str(r["assignee"]), "n": int(r["n"] or 0)} for r in rows]
+    finally:
+        conn.close()
+
+
+# --- WINDOWED story KPI helpers (time-filter aware) ---
+
+def _dt_expr(col: str) -> str:
+    """
+    Normalizes ISO-ish strings for SQLite datetime comparisons.
+    Works whether col has 'Z' or not.
+    """
+    return f"datetime(substr(replace(replace({col},'T',' '),'Z',''),1,19))"
+
+
+def get_story_status_counts_window(
+    *,
+    tenant_id: str = "default",
+    start_utc: str,
+    end_utc: str,
+    owner: str = "",
+) -> Dict[str, int]:
+    """
+    Counts by status for stories whose story_meta.updated_utc falls within [start_utc, end_utc].
+    Interprets windowed as "stories updated/touched in this time window".
+    """
+    conn = db_connect()
+    try:
+        where = ["tenant_id = ?"]
+        params: List[Any] = [tenant_id]
+
+        if owner.strip():
+            where.append("COALESCE(owner,'') = ?")
+            params.append(owner.strip())
+
+        dt = _dt_expr("updated_utc")
+        where.append(f"{dt} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))")
+        params.append(start_utc)
+        where.append(f"{dt} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))")
+        params.append(end_utc)
+
+        rows = conn.execute(
+            f"""
+            SELECT status, COUNT(1) AS n
+            FROM story_meta
+            WHERE {" AND ".join(where)}
+            GROUP BY status
+            """,
+            params,
+        ).fetchall()
+
+        out: Dict[str, int] = {}
+        for r in rows:
+            out[str(r["status"] or "New")] = int(r["n"] or 0)
+        return out
+    finally:
+        conn.close()
+
+
+def get_story_assignment_counts_window(
+    *,
+    tenant_id: str = "default",
+    start_utc: str,
+    end_utc: str,
+    top_n: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Counts by owner (assignee) for stories whose story_meta.updated_utc falls within [start_utc, end_utc].
+    This is "activity in window by assignee", NOT current workload.
+    """
+    top_n = max(1, min(int(top_n or 12), 50))
+    conn = db_connect()
+    try:
+        dt = _dt_expr("updated_utc")
+        rows = conn.execute(
+            f"""
+            SELECT
+              CASE WHEN COALESCE(owner,'') = '' THEN 'Unassigned' ELSE owner END AS assignee,
+              COUNT(1) AS n
+            FROM story_meta
+            WHERE tenant_id = ?
+              AND {dt} >= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+              AND {dt} <= datetime(substr(replace(replace(?,'T',' '),'Z',''),1,19))
+            GROUP BY assignee
+            ORDER BY n DESC, assignee ASC
+            LIMIT ?
+            """,
+            (tenant_id, start_utc, end_utc, top_n),
+        ).fetchall()
+
+        return [{"assignee": str(r["assignee"]), "n": int(r["n"] or 0)} for r in rows]
+    finally:
+        conn.close()
+
 
 # =============================
 # ADMIN AUDIT (compat layer for admin.py patches)
@@ -1160,9 +1319,13 @@ def list_audit_events(
 # ADMIN AUDIT KPI HELPERS
 # =============================
 def _iso_utc(dt: datetime) -> str:
-    # Matches how created_utc is stored (datetime.utcnow().isoformat())
-    # IMPORTANT: keep the same format consistently or string compares break.
-    return dt.isoformat()
+    # Canonical UTC ISO seconds + 'Z' (matches write_audit_event storage)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
 
 
 def admin_audit_count_since(*, cutoff_utc: datetime, tenant_id: str = "default") -> int:
@@ -1280,7 +1443,9 @@ def get_admin_audit_kpis(
         "meta_set",
     }
 
-    def _count_login_failures(conn, *, tenant_id: str, start_utc: str, end_utc: str) -> int:
+    def _count_login_failures(
+        conn: sqlite3.Connection, *, tenant_id: str, start_utc: str, end_utc: str
+    ) -> int:
         """
         Counts failed login attempts in [start_utc, end_utc] based on your real schema:
           action='login_attempt' AND details_json contains ok=false (or ok:0)
@@ -1302,79 +1467,9 @@ def get_admin_audit_kpis(
             (tenant_id, start_utc, end_utc),
         ).fetchone()
         return int(row["n"] or 0) if row else 0
-    
-
-# state_db.py
-
-def get_story_status_counts(
-    *,
-    tenant_id: str = "default",
-    owner: str = "",            # if set -> filter to this owner (user-scoped)
-) -> Dict[str, int]:
-    """
-    Returns counts by status from story_meta.
-    If owner is provided, filters to that owner.
-    """
-    conn = db_connect()
-    try:
-        where = ["tenant_id = ?"]
-        params: List[Any] = [tenant_id]
-
-        if owner.strip():
-            where.append("COALESCE(owner,'') = ?")
-            params.append(owner.strip())
-
-        rows = conn.execute(
-            f"""
-            SELECT status, COUNT(1) AS n
-            FROM story_meta
-            WHERE {" AND ".join(where)}
-            GROUP BY status
-            """,
-            params,
-        ).fetchall()
-
-        out: Dict[str, int] = {}
-        for r in rows:
-            out[str(r["status"] or "New")] = int(r["n"] or 0)
-        return out
-    finally:
-        conn.close()
-
-
-def get_story_assignment_counts(
-    *,
-    tenant_id: str = "default",
-    top_n: int = 12,
-) -> List[Dict[str, Any]]:
-    """
-    Returns counts by owner (assignee). Includes 'Unassigned'.
-    """
-    top_n = max(1, min(int(top_n or 12), 50))
-    conn = db_connect()
-    try:
-        # Treat empty owner as Unassigned
-        rows = conn.execute(
-            """
-            SELECT
-              CASE WHEN COALESCE(owner,'') = '' THEN 'Unassigned' ELSE owner END AS assignee,
-              COUNT(1) AS n
-            FROM story_meta
-            WHERE tenant_id = ?
-            GROUP BY assignee
-            ORDER BY n DESC, assignee ASC
-            LIMIT ?
-            """,
-            (tenant_id, top_n),
-        ).fetchall()
-
-        return [{"assignee": str(r["assignee"]), "n": int(r["n"] or 0)} for r in rows]
-    finally:
-        conn.close()
-
 
     # -----------------------------
-    # WINDOW MODE
+    # WINDOW MODE (used by admin dashboard time filter)
     # -----------------------------
     if start_utc and end_utc:
         conn = db_connect()
@@ -1434,13 +1529,13 @@ def get_story_assignment_counts(
                     "target_id": str(last["target_id"] or ""),
                 }
 
-            # ✅ login failures in window (matches your dashboard chart logic)
+            # login failures in window
             login_fail_window = _count_login_failures(
                 conn, tenant_id=tenant_id, start_utc=start_utc, end_utc=end_utc
             )
 
             # privileged actions in window: explicit list
-            qmarks2 = ",".join(["?"] * len(privileged_actions))
+            qmarks = ",".join(["?"] * len(privileged_actions))
             pa1 = conn.execute(
                 f"""
                 SELECT COUNT(1) AS n
@@ -1448,7 +1543,7 @@ def get_story_assignment_counts(
                 WHERE tenant_id = ?
                   AND created_utc >= ?
                   AND created_utc <= ?
-                  AND action IN ({qmarks2})
+                  AND action IN ({qmarks})
                 """,
                 (tenant_id, start_utc, end_utc, *sorted(privileged_actions)),
             ).fetchone()
@@ -1503,7 +1598,7 @@ def get_story_assignment_counts(
             ).fetchall()
             top_actors = [{"actor_email": str(r["actor_email"]), "n": int(r["n"] or 0)} for r in rows]
 
-            # events by day (for tiny trend graph)
+            # events by day (for mini trend)
             rows = conn.execute(
                 """
                 SELECT substr(created_utc, 1, 10) AS day, COUNT(1) AS n
@@ -1519,7 +1614,7 @@ def get_story_assignment_counts(
             events_by_day = [{"day": str(r["day"]), "n": int(r["n"] or 0)} for r in rows]
 
             return {
-                # window-native keys (recommended)
+                # window-native keys (used by admin dashboard tiles)
                 "start_utc": start_utc,
                 "end_utc": end_utc,
                 "audit_window": total,
@@ -1532,7 +1627,7 @@ def get_story_assignment_counts(
                 "top_actors": top_actors,
                 "events_by_day": events_by_day,
 
-                # aliases (so older templates still work)
+                # aliases (keeps older templates/logic from breaking)
                 "audit_24h": total,
                 "top_actions_24h": top_actions,
                 "audit_last_event": last_event,
@@ -1547,7 +1642,6 @@ def get_story_assignment_counts(
     # -----------------------------
     now = now_utc()
 
-    # Keep your existing totals
     k24 = admin_audit_count_since(cutoff_utc=now - timedelta(days=1), tenant_id=tenant_id)
     k7 = admin_audit_count_since(cutoff_utc=now - timedelta(days=7), tenant_id=tenant_id)
     k30 = admin_audit_count_since(cutoff_utc=now - timedelta(days=30), tenant_id=tenant_id)
@@ -1559,20 +1653,17 @@ def get_story_assignment_counts(
     )
     last = admin_audit_last_event(tenant_id=tenant_id)
 
-    # ✅ Add a rolling login failure count too (useful for any pages still reading it)
-    start_24h = (now - timedelta(days=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
-    end_now = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    # rolling login failures (24h)
+    start_24h = (now - timedelta(days=1)).replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    end_now = now.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     login_fail_24h = 0
+    conn = db_connect()
     try:
-        conn = db_connect()
-        try:
-            _ensure_admin_audit_table(conn)
-            login_fail_24h = _count_login_failures(conn, tenant_id=tenant_id, start_utc=start_24h, end_utc=end_now)
-        finally:
-            conn.close()
-    except Exception:
-        login_fail_24h = 0
+        _ensure_admin_audit_table(conn)
+        login_fail_24h = _count_login_failures(conn, tenant_id=tenant_id, start_utc=start_24h, end_utc=end_now)
+    finally:
+        conn.close()
 
     return {
         "audit_24h": int(k24),

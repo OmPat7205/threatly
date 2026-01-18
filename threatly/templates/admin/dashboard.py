@@ -1096,35 +1096,70 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
       .catch(err => console.error("dashboard series fetch failed", err));
   })();
 
-    fetch("/admin/api/story_kpis", { credentials: "same-origin", cache: "no-store" })
-    .then(r => r.json())
-    .then(data => {
-      // Status chart
-      const st = data.status || [];
-      const stNonZero = st.filter(x => Number(x.n || 0) > 0);
-      const stLabels = stNonZero.map(x => x.status);
-      const stVals = stNonZero.map(x => Number(x.n || 0));
-      const STATUS_COLORS = {
-        "New": "#60A5FA",            // brighter blue
-        "In Progress": "#FB7185",    // softer rose
-        "On Hold": "#FBBF24",        // warm amber
-        "Escalated": "#F87171",      // softer red
-        "Closed": "#34D399",         // mint green
-        "Investigating": "#A78BFA",  // lavender
-        "Mitigated": "#CBD5E1",      // light slate
-        "Not Relevant": "#94A3B8",
-        "Not relevant": "#94A3B8"
-      };
+  (function(){
+  const qs = window.location.search || ""; // carries w/from/to
+  const STORAGE_KEYS = {
+    storyStatus: "admin_story_status_mode",
+    assignments: "admin_assignments_mode",
+  };
 
-    const ctxStatus = document.getElementById("chartStoryStatus").getContext("2d");
-      new Chart(ctxStatus, {
+  function getMode(key, fallback){
+    return localStorage.getItem(STORAGE_KEYS[key]) || fallback;
+  }
+  function setMode(key, mode){
+    localStorage.setItem(STORAGE_KEYS[key], mode);
+  }
+
+  function setSegActive(segEl, mode){
+    const links = segEl.querySelectorAll("a[data-mode]");
+    links.forEach(a => {
+      a.classList.toggle("active", (a.getAttribute("data-mode") === mode));
+    });
+  }
+
+  let chartStatus = null;
+  let chartAsg = null;
+
+  function renderStoryCharts(payload){
+    const modeStatus = getMode("storyStatus", "windowed");
+    const modeAsg = getMode("assignments", "snapshot");
+
+    // Update UI
+    document.querySelectorAll('.seg[data-toggle="storyStatus"]').forEach(seg => setSegActive(seg, modeStatus));
+    document.querySelectorAll('.seg[data-toggle="assignments"]').forEach(seg => setSegActive(seg, modeAsg));
+
+    const statusBlock = (payload[modeStatus] || payload.snapshot || {}).status || [];
+    const asgBlock = (payload[modeAsg] || payload.snapshot || {}).assignments || [];
+
+    // ---- doughnut ----
+    const stNonZero = statusBlock.filter(x => Number(x.n || 0) > 0);
+    const stLabels = stNonZero.map(x => x.status);
+    const stVals = stNonZero.map(x => Number(x.n || 0));
+
+    const STATUS_COLORS = {
+      "New": "#60A5FA",
+      "In Progress": "#FB7185",
+      "On Hold": "#FBBF24",
+      "Escalated": "#F87171",
+      "Closed": "#34D399",
+      "Investigating": "#A78BFA",
+      "Mitigated": "#CBD5E1",
+      "Not Relevant": "#94A3B8",
+      "Not relevant": "#94A3B8"
+    };
+
+    const elStatus = document.getElementById("chartStoryStatus");
+    if (elStatus) {
+      const ctx = elStatus.getContext("2d");
+      if (chartStatus) chartStatus.destroy();
+      chartStatus = new Chart(ctx, {
         type: "doughnut",
         data: {
           labels: stLabels,
           datasets: [{
             label: "Stories",
             data: stVals,
-            backgroundColor: stLabels.map(l => STATUS_COLORS[l] || "#64748B"),
+            backgroundColor: stLabels.map(l => STATUS_COLORS[l] || "#94A3B8"),
             borderColor: "rgba(2,6,23,.85)",
             borderWidth: 2,
             hoverOffset: 6
@@ -1138,11 +1173,13 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
             legend: {
               position: "bottom",
               labels: {
-                color: "rgba(250,250,250,.88)",
-                boxWidth: 16,
+                color: "rgba(255,255,255,.94)",
+                boxWidth: 14,
                 boxHeight: 10,
-                padding: 16,
-                font: { size: 12, weight: "700" }
+                padding: 18,
+                usePointStyle: true,
+                pointStyle: "rectRounded",
+                font: { size: 12, weight: "800" }
               }
             },
             tooltip: {
@@ -1150,33 +1187,50 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
               titleColor: "rgba(250,250,250,.95)",
               bodyColor: "rgba(250,250,250,.90)",
               borderColor: "rgba(255,255,255,.10)",
-              borderWidth: 1
+              borderWidth: 1,
+              callbacks: {
+                label: function(ctx){
+                  const total = (ctx.dataset.data || []).reduce((a,b)=>a+Number(b||0),0) || 0;
+                  const v = Number(ctx.raw || 0);
+                  const pct = total ? ((v/total)*100).toFixed(1) : "0.0";
+                  return ` ${ctx.label}: ${v} (${pct}%)`;
+                }
+              }
             }
           }
         }
       });
 
+      // Optional "interactive": click slice => toggle visibility (no routing assumptions)
+      elStatus.onclick = (evt) => {
+        const points = chartStatus.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, true);
+        if (!points.length) return;
+        const idx = points[0].index;
+        chartStatus.toggleDataVisibility(idx);
+        chartStatus.update();
+      };
+    }
 
-      // Assignments chart (horizontal)
-      const asg = data.assignments || [];
-      const asgVals = asg.map(x => Number(x.n || 0));
+    // ---- assignments bar ----
+    const asg = asgBlock || [];
+    const asgVals = asg.map(x => Number(x.n || 0));
+    const asgLabels = asg.map(x => {
+      const s = String(x.assignee || "");
+      if (s.length <= 22) return s;
+      const at = s.indexOf("@");
+      if (at > 0) {
+        const head = s.slice(0, Math.min(10, at));
+        const tail = s.slice(Math.max(at, s.length - 12));
+        return head + "…" + tail;
+      }
+      return s.slice(0, 18) + "…";
+    });
 
-      const asgLabels = asg.map(x => {
-        const s = String(x.assignee || "");
-        if (s.length <= 22) return s;
-        // keep start + domain tail for readability
-        const at = s.indexOf("@");
-        if (at > 0) {
-          const head = s.slice(0, Math.min(10, at));
-          const tail = s.slice(Math.max(at, s.length - 12));
-          return head + "…" + tail;
-        }
-        return s.slice(0, 18) + "…";
-      });
-
-
-      const ctxAsg = document.getElementById("chartAssignments").getContext("2d");
-      new Chart(ctxAsg, {
+    const elAsg = document.getElementById("chartAssignments");
+    if (elAsg) {
+      const ctx = elAsg.getContext("2d");
+      if (chartAsg) chartAsg.destroy();
+      chartAsg = new Chart(ctx, {
         type: "bar",
         data: {
           labels: asgLabels,
@@ -1185,7 +1239,6 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
             data: asgVals,
             backgroundColor: "rgba(96,165,250,.95)",
             borderColor: "rgba(96,165,250,1)",
-
             borderWidth: 1,
             borderRadius: 10,
             barThickness: 26
@@ -1207,63 +1260,103 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
           },
           scales: {
             x: {
-              ticks: {
-                color: "rgba(250,250,250,.90)",
-                font: { weight: "700" }
-              },
-              grid: {
-                color: "rgba(255,255,255,.09)"
-              },
-              border: {
-                color: "rgba(255,255,255,.10)"
-              }
+              ticks: { color: "rgba(250,250,250,.90)", font: { weight: "800" } },
+              grid: { color: "rgba(255,255,255,.09)" },
+              border: { color: "rgba(255,255,255,.10)" }
             },
             y: {
-              ticks: {
-                color: "rgba(250,250,250,.90)",
-                font: { weight: "750" }
-              },
-              grid: {
-                display: false
-              },
-              border: {
-                color: "rgba(255,255,255,.10)"
-              }
+              ticks: { color: "rgba(250,250,250,.90)", font: { weight: "850" } },
+              grid: { display: false },
+              border: { color: "rgba(255,255,255,.10)" }
             }
           }
         }
       });
 
+      // Optional "interactive": click bar => highlight only that bar (simple, no routes)
+      elAsg.onclick = (evt) => {
+        const points = chartAsg.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, true);
+        if (!points.length) return;
+        const idx = points[0].index;
+        const meta = chartAsg.getDatasetMeta(0);
+        meta.data.forEach((bar, i) => bar.hidden = (i !== idx) ? true : false);
+        chartAsg.update();
+        // click again anywhere empty to reset
+      };
+    }
+  }
+
+  function wireSegToggles(payload){
+    document.querySelectorAll('.seg[data-toggle]').forEach(seg => {
+      const key = seg.getAttribute("data-toggle");
+      seg.querySelectorAll("a[data-mode]").forEach(a => {
+        a.addEventListener("click", (e) => {
+          e.preventDefault();
+          const mode = a.getAttribute("data-mode");
+          setMode(key, mode);
+          renderStoryCharts(payload);
+        });
+      });
+    });
+  }
+
+  fetch("/admin/api/story_kpis" + qs, { credentials: "same-origin", cache: "no-store" })
+    .then(r => r.json())
+    .then(data => {
+      // data has {snapshot, windowed, meta}
+      wireSegToggles(data);
+      renderStoryCharts(data);
     })
     .catch(err => console.error("story KPI fetch failed", err));
+})();
+
 
   </script>
 
-  <div class="muted" style="margin-top:10px;">
-    Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
-  </div>
-</div>
-<div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
-  <div class="kpi-card">
-    <div class="kpi-head">
-      <div class="kpi-label">Story status distribution</div>
-      <span class="tip" tabindex="0" data-tip="Snapshot of current story statuses (not time-windowed).">i</span>
-    </div>
-    <div class="chart-wrap" style="height:260px; margin-top:10px;">
-      <canvas id="chartStoryStatus"></canvas>
-    </div>
-  </div>
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
+      <div class="kpi-card">
+        <div class="kpi-head">
+          <div class="kpi-label">Story status distribution</div>
+          <span class="tip" tabindex="0" data-tip="Snapshot = current statuses. Windowed = stories touched (updated) in the selected time range.">i</span>
+        </div>
 
-  <div class="kpi-card">
-    <div class="kpi-head">
-      <div class="kpi-label">Assigned stories per user</div>
-      <span class="tip" tabindex="0" data-tip="Snapshot of current assignments. Includes Unassigned.">i</span>
+        <!-- toggle header OUTSIDE chart-wrap -->
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+          <div style="font-weight:950;">Story status</div>
+          <div class="seg" data-toggle="storyStatus">
+            <a href="#" data-mode="windowed">Windowed</a>
+            <a href="#" data-mode="snapshot">Snapshot</a>
+          </div>
+        </div>
+
+        <div class="chart-wrap" style="height:260px; margin-top:10px;">
+          <canvas id="chartStoryStatus"></canvas>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-head">
+          <div class="kpi-label">Assigned stories per user</div>
+          <span class="tip" tabindex="0" data-tip="Snapshot = current assignments. Windowed = activity in range grouped by assignee.">i</span>
+        </div>
+
+        <!-- toggle header OUTSIDE chart-wrap -->
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+          <div style="font-weight:950;">Assigned stories</div>
+          <div class="seg" data-toggle="assignments">
+            <a href="#" data-mode="snapshot">Snapshot</a>
+            <a href="#" data-mode="windowed">Windowed</a>
+          </div>
+        </div>
+
+        <div class="chart-wrap" style="height:260px; margin-top:10px;">
+          <canvas id="chartAssignments"></canvas>
+        </div>
+      </div>
     </div>
-    <div class="chart-wrap" style="height:260px; margin-top:10px;">
-      <canvas id="chartAssignments"></canvas>
+
+    <div class="muted" style="margin-top:10px;">
+      Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
     </div>
   </div>
-</div>
-
-
 """

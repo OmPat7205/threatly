@@ -1095,10 +1095,175 @@ ADMIN_DASHBOARD_TEMPLATE = r"""
       .then(data => buildCharts(data))
       .catch(err => console.error("dashboard series fetch failed", err));
   })();
+
+    fetch("/admin/api/story_kpis", { credentials: "same-origin", cache: "no-store" })
+    .then(r => r.json())
+    .then(data => {
+      // Status chart
+      const st = data.status || [];
+      const stNonZero = st.filter(x => Number(x.n || 0) > 0);
+      const stLabels = stNonZero.map(x => x.status);
+      const stVals = stNonZero.map(x => Number(x.n || 0));
+      const STATUS_COLORS = {
+        "New": "#60A5FA",            // brighter blue
+        "In Progress": "#FB7185",    // softer rose
+        "On Hold": "#FBBF24",        // warm amber
+        "Escalated": "#F87171",      // softer red
+        "Closed": "#34D399",         // mint green
+        "Investigating": "#A78BFA",  // lavender
+        "Mitigated": "#CBD5E1",      // light slate
+        "Not Relevant": "#94A3B8",
+        "Not relevant": "#94A3B8"
+      };
+
+    const ctxStatus = document.getElementById("chartStoryStatus").getContext("2d");
+      new Chart(ctxStatus, {
+        type: "doughnut",
+        data: {
+          labels: stLabels,
+          datasets: [{
+            label: "Stories",
+            data: stVals,
+            backgroundColor: stLabels.map(l => STATUS_COLORS[l] || "#64748B"),
+            borderColor: "rgba(2,6,23,.85)",
+            borderWidth: 2,
+            hoverOffset: 6
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          cutout: "62%",
+          plugins: {
+            legend: {
+              position: "bottom",
+              labels: {
+                color: "rgba(250,250,250,.88)",
+                boxWidth: 16,
+                boxHeight: 10,
+                padding: 16,
+                font: { size: 12, weight: "700" }
+              }
+            },
+            tooltip: {
+              backgroundColor: "rgba(18,18,20,.96)",
+              titleColor: "rgba(250,250,250,.95)",
+              bodyColor: "rgba(250,250,250,.90)",
+              borderColor: "rgba(255,255,255,.10)",
+              borderWidth: 1
+            }
+          }
+        }
+      });
+
+
+      // Assignments chart (horizontal)
+      const asg = data.assignments || [];
+      const asgVals = asg.map(x => Number(x.n || 0));
+
+      const asgLabels = asg.map(x => {
+        const s = String(x.assignee || "");
+        if (s.length <= 22) return s;
+        // keep start + domain tail for readability
+        const at = s.indexOf("@");
+        if (at > 0) {
+          const head = s.slice(0, Math.min(10, at));
+          const tail = s.slice(Math.max(at, s.length - 12));
+          return head + "…" + tail;
+        }
+        return s.slice(0, 18) + "…";
+      });
+
+
+      const ctxAsg = document.getElementById("chartAssignments").getContext("2d");
+      new Chart(ctxAsg, {
+        type: "bar",
+        data: {
+          labels: asgLabels,
+          datasets: [{
+            label: "Assigned stories",
+            data: asgVals,
+            backgroundColor: "rgba(96,165,250,.95)",
+            borderColor: "rgba(96,165,250,1)",
+
+            borderWidth: 1,
+            borderRadius: 10,
+            barThickness: 26
+          }]
+        },
+        options: {
+          indexAxis: "y",
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "rgba(18,18,20,.96)",
+              titleColor: "rgba(250,250,250,.95)",
+              bodyColor: "rgba(250,250,250,.90)",
+              borderColor: "rgba(255,255,255,.10)",
+              borderWidth: 1
+            }
+          },
+          scales: {
+            x: {
+              ticks: {
+                color: "rgba(250,250,250,.90)",
+                font: { weight: "700" }
+              },
+              grid: {
+                color: "rgba(255,255,255,.09)"
+              },
+              border: {
+                color: "rgba(255,255,255,.10)"
+              }
+            },
+            y: {
+              ticks: {
+                color: "rgba(250,250,250,.90)",
+                font: { weight: "750" }
+              },
+              grid: {
+                display: false
+              },
+              border: {
+                color: "rgba(255,255,255,.10)"
+              }
+            }
+          }
+        }
+      });
+
+    })
+    .catch(err => console.error("story KPI fetch failed", err));
+
   </script>
 
   <div class="muted" style="margin-top:10px;">
     Tip: Provision users in <span class="badge code">Users</span>, verify changes in <span class="badge code">Audit</span>.
   </div>
 </div>
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
+  <div class="kpi-card">
+    <div class="kpi-head">
+      <div class="kpi-label">Story status distribution</div>
+      <span class="tip" tabindex="0" data-tip="Snapshot of current story statuses (not time-windowed).">i</span>
+    </div>
+    <div class="chart-wrap" style="height:260px; margin-top:10px;">
+      <canvas id="chartStoryStatus"></canvas>
+    </div>
+  </div>
+
+  <div class="kpi-card">
+    <div class="kpi-head">
+      <div class="kpi-label">Assigned stories per user</div>
+      <span class="tip" tabindex="0" data-tip="Snapshot of current assignments. Includes Unassigned.">i</span>
+    </div>
+    <div class="chart-wrap" style="height:260px; margin-top:10px;">
+      <canvas id="chartAssignments"></canvas>
+    </div>
+  </div>
+</div>
+
+
 """

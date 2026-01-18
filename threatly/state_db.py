@@ -1302,6 +1302,76 @@ def get_admin_audit_kpis(
             (tenant_id, start_utc, end_utc),
         ).fetchone()
         return int(row["n"] or 0) if row else 0
+    
+
+# state_db.py
+
+def get_story_status_counts(
+    *,
+    tenant_id: str = "default",
+    owner: str = "",            # if set -> filter to this owner (user-scoped)
+) -> Dict[str, int]:
+    """
+    Returns counts by status from story_meta.
+    If owner is provided, filters to that owner.
+    """
+    conn = db_connect()
+    try:
+        where = ["tenant_id = ?"]
+        params: List[Any] = [tenant_id]
+
+        if owner.strip():
+            where.append("COALESCE(owner,'') = ?")
+            params.append(owner.strip())
+
+        rows = conn.execute(
+            f"""
+            SELECT status, COUNT(1) AS n
+            FROM story_meta
+            WHERE {" AND ".join(where)}
+            GROUP BY status
+            """,
+            params,
+        ).fetchall()
+
+        out: Dict[str, int] = {}
+        for r in rows:
+            out[str(r["status"] or "New")] = int(r["n"] or 0)
+        return out
+    finally:
+        conn.close()
+
+
+def get_story_assignment_counts(
+    *,
+    tenant_id: str = "default",
+    top_n: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Returns counts by owner (assignee). Includes 'Unassigned'.
+    """
+    top_n = max(1, min(int(top_n or 12), 50))
+    conn = db_connect()
+    try:
+        # Treat empty owner as Unassigned
+        rows = conn.execute(
+            """
+            SELECT
+              CASE WHEN COALESCE(owner,'') = '' THEN 'Unassigned' ELSE owner END AS assignee,
+              COUNT(1) AS n
+            FROM story_meta
+            WHERE tenant_id = ?
+            GROUP BY assignee
+            ORDER BY n DESC, assignee ASC
+            LIMIT ?
+            """,
+            (tenant_id, top_n),
+        ).fetchall()
+
+        return [{"assignee": str(r["assignee"]), "n": int(r["n"] or 0)} for r in rows]
+    finally:
+        conn.close()
+
 
     # -----------------------------
     # WINDOW MODE

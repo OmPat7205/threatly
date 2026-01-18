@@ -9,7 +9,9 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, Response, abort, redirect, render_template_string, request, url_for
+
+from flask import Blueprint, Response, abort, redirect, render_template_string, request, url_for,jsonify
+from threatly.state_db import get_story_status_counts, get_story_assignment_counts
 
 from threatly.config import STATE_DB_PATH, WATCHLIST_PATH
 from threatly.rbac import require_perm, has_perm
@@ -348,15 +350,25 @@ def _render_admin(content_template: str, *, title: str, active: str, **ctx: Any)
 # -----------------------------
 # Watchlist settings (enterprise)
 # -----------------------------
-def _now_iso_z() -> str:
-    return _iso_z(datetime.utcnow())
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now (Python 3.12+ safe)."""
+    return datetime.now(timezone.utc)
 
 def _iso_z(dt: datetime) -> str:
     """
     Return an ISO-8601 UTC timestamp with trailing 'Z', seconds precision.
+    Accepts naive or aware dt; naive is treated as UTC.
     Example: 2026-01-16T21:34:12Z
     """
-    return dt.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def _now_iso_z() -> str:
+    return _iso_z(_utcnow())
+
 def _compute_window_from_request(args) -> Tuple[str, str, str, datetime, datetime, str, str, str]:
     """
     Returns:
@@ -380,7 +392,7 @@ def _compute_window_from_request(args) -> Tuple[str, str, str, datetime, datetim
     raw_from = _q("from", "")
     raw_to = _q("to", "")
 
-    now = datetime.utcnow()
+    now = _utcnow()
     start_dt = now - timedelta(days=1)
     end_dt = now
 
@@ -846,7 +858,7 @@ def admin_home():
     raw_to = _q("to", "")
 
 
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # defaults
     start_dt = now - timedelta(days=1)
@@ -918,7 +930,8 @@ def admin_home():
         start_utc=start_iso,
         end_utc=end_iso,
         top_n=10,
-    )
+    ) or {}
+
 
     # ---- previous-window comparison (same duration) ----
     window_len = (end_dt - start_dt)
@@ -933,6 +946,8 @@ def admin_home():
         end_utc=prev_end_iso,
         top_n=10,
     )
+    audit_prev = audit_prev or {}
+
 
     # ---- deltas + risk levels for key window KPIs ----
     def _mk_metric(key: str) -> Dict[str, Any]:
@@ -1004,11 +1019,6 @@ def admin_home():
     )
 
 
-
-
-
-
-from flask import jsonify
 
 def _query_dashboard_series(*, tenant_id: str, start_utc: str, end_utc: str, bucket: str) -> Dict[str, Any]:
     """
@@ -1126,7 +1136,7 @@ def admin_dashboard_series():
     raw_to = _q("to", "")
 
 
-    now = datetime.utcnow()
+    now = _utcnow()
     start_dt = now - timedelta(days=1)
     end_dt = now
 
@@ -1499,7 +1509,7 @@ def admin_reviews_export_csv_global():
         days = 30
     days = max(1, min(days, 365))
 
-    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds") + "Z"
+    cutoff = _iso_z(_utcnow() - timedelta(days=days))
 
     conn = _db()
     try:
@@ -2033,3 +2043,29 @@ def admin_settings_watchlist_rollback(version_id: str):
     )
 
     return redirect(url_for("admin.admin_settings"))
+
+
+# admin.py
+
+
+@admin_bp.get("/api/story_kpis")
+@require_perm("view_admin")
+def admin_story_kpis():
+    ensure_admin_tables()
+    # global snapshot
+    status = get_story_status_counts(tenant_id=TENANT_ID_DEFAULT)
+    assignments = get_story_assignment_counts(tenant_id=TENANT_ID_DEFAULT, top_n=12)
+
+    # normalize to a stable status order (optional, nice UI)
+    status_order = ["New", "In Progress", "On Hold", "Escalated", "Closed"]
+    status_out = [{"status": s, "n": int(status.get(s, 0))} for s in status_order]
+    # include any unknown statuses at the end
+    for k, v in status.items():
+        if k not in status_order:
+            status_out.append({"status": k, "n": int(v)})
+
+    return jsonify({
+        "status": status_out,
+        "assignments": assignments,
+    })
+

@@ -344,7 +344,11 @@ ADMIN_BASE_TEMPLATE = r"""
         <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
           <a class="btn" href="/">← Back</a>
           <a class="btn ghost" href="/health">Health</a>
-          <a class="btn danger" href="/logout">Logout</a>
+          <form method="post" action="/logout" style="margin:0;">
+            <input type="hidden" name="csrf" value="{{ csrf_token|default('') }}">
+            <button type="submit" class="btn danger">Logout</button>
+          </form>
+
         </div>
       </div>
 

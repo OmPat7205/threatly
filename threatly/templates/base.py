@@ -328,6 +328,29 @@ BASE_TEMPLATE = r"""
       margin:6px 0;
     }
 
+        /* Make a POST logout button look like the dropdown links */
+    .menu-link-btn{
+      width:100%;
+      display:flex;
+      align-items:center;
+      gap:10px;
+      padding:10px 10px;
+      border-radius: var(--r2);
+      font-weight:900;
+      color: rgba(250,250,250,.92);
+      border:1px solid transparent;
+      background: transparent;
+      cursor:pointer;
+      text-align:left;
+      font-family: inherit;
+      font-size: inherit;
+    }
+    .menu-link-btn:hover{
+      background: rgba(255,255,255,.05);
+      border-color: rgba(255,255,255,.10);
+    }
+
+
     /* Sources */
     .source-list{ display:flex; flex-direction:column; gap:8px; margin-top:10px; }
     body.compact .source-list{ gap:7px; margin-top:8px; }
@@ -537,6 +560,73 @@ BASE_TEMPLATE = r"""
       border-color: rgba(34,197,94,.45);
       box-shadow: 0 0 0 3px rgba(34,197,94,.12);
     }
+
+          /* KPI cards as links */
+          .kpi-link{
+            display:block;
+            text-decoration:none;
+            color: inherit;
+          }
+          .kpi-link:focus{
+            outline: none;
+          }
+          .kpi-link:focus .kpi{
+            box-shadow: 0 0 0 3px rgba(34,197,94,.18), var(--shadow2);
+            border-color: rgba(34,197,94,.35);
+          }
+
+
+    
+        /* ===== User KPI strip (Phase 2) ===== */
+        .kpi-strip{
+          margin-top: 14px;
+          display:grid;
+          grid-template-columns: repeat(5, minmax(150px, 1fr));
+          gap: 12px;
+        }
+        @media (max-width: 1200px){
+          .kpi-strip{ grid-template-columns: repeat(3, minmax(150px, 1fr)); }
+        }
+        @media (max-width: 820px){
+          .kpi-strip{ grid-template-columns: repeat(2, minmax(150px, 1fr)); }
+        }
+
+        .kpi{
+          border: 1px solid rgba(255,255,255,.10);
+          background: rgba(24,24,27,.55);
+          border-radius: var(--r);
+          box-shadow: var(--shadow2);
+          padding: 12px 12px 10px;
+          min-width: 0;
+        }
+        .kpi .k{
+          font-size: 12px;
+          letter-spacing: .12em;
+          text-transform: uppercase;
+          color: rgba(250,250,250,.60);
+          font-weight: 950;
+        }
+        .kpi .v{
+          margin-top: 8px;
+          font-size: 22px;
+          font-weight: 980;
+          letter-spacing: -.3px;
+          font-variant-numeric: tabular-nums;
+        }
+        .kpi .s{
+          margin-top: 6px;
+          font-size: 12px;
+          color: rgba(250,250,250,.62);
+          font-weight: 850;
+          line-height: 1.35;
+        }
+
+        /* optional “risk tint” */
+        .kpi.good{ border-color: rgba(34,197,94,.25); }
+        .kpi.warn{ border-color: rgba(245,158,11,.28); }
+        .kpi.danger{ border-color: rgba(239,68,68,.30); }
+
+
 
     /* ===== Main ===== */
     .main{ padding:20px 20px 60px 20px; }
@@ -941,7 +1031,12 @@ BASE_TEMPLATE = r"""
 
                   <div class="sep"></div>
                   <a href="/health">🩺 Health</a>
-                  <a href="/logout">🚪 Logout</a>
+                  <form method="post" action="/logout" style="margin:0;">
+                    <input type="hidden" name="csrf" value="{{ csrf_token|default('') }}">
+
+                    <button type="submit" class="menu-link-btn">🚪 Logout</button>
+                  </form>
+
                 </div>
               </div>
             {% else %}
@@ -1215,9 +1310,72 @@ BASE_TEMPLATE = r"""
         </section>
       {% endif %}
 
+      {# =============================
+        Phase 2: User KPIs (non-admin safe)
+        ============================= #}
+      {% if is_authed and (user_kpis is defined) %}
+        {% set uk = user_kpis or {} %}
+        <section class="kpi-strip" aria-label="Your KPIs">
+          {# Assigned open #}
+          {% set v_open = (uk.assigned_open|default(0))|int %}
+          <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'assigned_open'}) }}" title="View your open assigned stories">
+            <div class="kpi {% if v_open >= 30 %}danger{% elif v_open >= 15 %}warn{% else %}good{% endif %}">
+              <div class="k">Assigned open</div>
+              <div class="v">{{ v_open }}</div>
+              <div class="s">Cases assigned to you that still need action.</div>
+            </div>
+          </a>
+
+
+
+          {# Assigned done #}
+            {% set v_done = (uk.assigned_done|default(0))|int %}
+            <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'assigned_done'}) }}" title="View your done/closed assigned stories">
+              <div class="kpi good">
+                <div class="k">Assigned done</div>
+                <div class="v">{{ v_done }}</div>
+                <div class="s">Cases you’ve closed (Mitigated / Not Relevant).</div>
+              </div>
+            </a>
+
+            {# Reviewed total #}
+            {% set v_total = (uk.reviewed_total|default(0))|int %}
+            <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'reviewed_total'}) }}" title="View all stories you have reviewed">
+              <div class="kpi">
+                <div class="k">Reviewed total</div>
+                <div class="v">{{ v_total }}</div>
+                <div class="s">Total stories you’ve reviewed (all time).</div>
+              </div>
+            </a>
+
+            {# Reviewed 24h #}
+            {% set v_24 = (uk.reviewed_24h|default(0))|int %}
+            <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'reviewed_24h'}) }}" title="View stories you reviewed in the last 24 hours">
+              <div class="kpi {% if v_24 >= 25 %}good{% elif v_24 >= 10 %}good{% else %}warn{% endif %}">
+                <div class="k">Reviewed (24h)</div>
+                <div class="v">{{ v_24 }}</div>
+                <div class="s">Stories you reviewed in the last 24 hours.</div>
+              </div>
+            </a>
+
+
+          {# Unreviewed assigned open #}
+              {% set v_unrev = (uk.unreviewed_assigned|default(0))|int %}
+              <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'unreviewed_assigned'}) }}" title="View your unreviewed assigned stories">
+
+            <div class="kpi {% if v_unrev >= 10 %}danger{% elif v_unrev >= 4 %}warn{% else %}good{% endif %}">
+              <div class="k">Unreviewed assigned</div>
+              <div class="v">{{ v_unrev }}</div>
+              <div class="s">Open assigned stories you haven’t reviewed yet.</div>
+            </div>
+          </a>
+
+        </section>
+      {% endif %}
+
       <div class="headline">
         <div>
-          <h1>Threat feed</h1>
+          <h1>Threat Feed</h1>
 
           {# ===== Delta subline (shows only when Delta filter is ON) ===== #}
           <div class="sub">

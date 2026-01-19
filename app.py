@@ -47,7 +47,21 @@ from threatly.config import (
     WATCHLIST_PATH,
     REFRESH_TTL_SECONDS,
     SNAPSHOT_MAX_DAYS,
+    DONE_STATUS_VALUES
 )
+
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(STATE_DB_PATH, timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+    return conn
+
+
 from threatly.state_db import (
     init_state_db,
     # Seen is per-user:
@@ -69,6 +83,12 @@ from threatly.state_db import (
     # Institutional memory:
     record_story_fingerprint,
     get_memory_map,
+    # User KPIs
+    user_assigned_open_count,
+    user_assigned_done_count,
+    user_reviewed_total,
+    user_reviewed_since,
+    user_unreviewed_assigned_open_count,
 )
 from threatly.templates import TEMPLATES
 
@@ -93,8 +113,9 @@ from threatly.watchlist import (
 # =============================
 # AUTH CONFIG
 # =============================
-AUTH_REQUIRE_LOGIN = os.environ.get("AUTH_REQUIRE_LOGIN", "0").strip() == "1"
-APP_SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+from threatly.config import AUTH_REQUIRE_LOGIN, SECRET_KEY
+APP_SECRET_KEY = (os.environ.get("SECRET_KEY") or SECRET_KEY or "").strip()
+
 
 # Enterprise default: signup OFF
 SIGNUP_ENABLED = os.environ.get("SIGNUP_ENABLED", "0").strip() == "1"
@@ -110,7 +131,10 @@ def _get_snapshot_items() -> Tuple[List[Dict[str, Any]], List[str]]:
 # APP + LOGGING
 # =============================
 app = Flask(__name__)
-app.secret_key = APP_SECRET_KEY if APP_SECRET_KEY else os.urandom(32)
+app.secret_key = APP_SECRET_KEY
+if not APP_SECRET_KEY:
+    raise RuntimeError("SECRET_KEY must be set (refuse to start without it).")
+
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -121,22 +145,20 @@ log = logging.getLogger("threatly")
 # =============================
 # SESSION HARDENING (enterprise)
 # =============================
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0").strip() == "1"
-
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=COOKIE_SECURE,
-    PERMANENT_SESSION_LIFETIME=timedelta(
-        hours=int(os.environ.get("SESSION_HOURS", "12"))
-    ),
+from threatly.config import (
+    SESSION_COOKIE_SECURE,
+    SESSION_COOKIE_HTTPONLY,
+    SESSION_COOKIE_SAMESITE,
 )
 
-if AUTH_REQUIRE_LOGIN and not APP_SECRET_KEY:
-    log.warning(
-        "AUTH_REQUIRE_LOGIN=1 but SECRET_KEY is not set. "
-        "Sessions will reset on restart. Set SECRET_KEY in env."
-    )
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=bool(SESSION_COOKIE_HTTPONLY),
+    SESSION_COOKIE_SAMESITE=str(SESSION_COOKIE_SAMESITE or "Lax"),
+    SESSION_COOKIE_SECURE=bool(SESSION_COOKIE_SECURE),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=int(os.environ.get("SESSION_HOURS", "12"))),
+)
+
+
 
 # Admin blueprint
 app.register_blueprint(admin_bp)
@@ -152,16 +174,25 @@ def current_tenant_id() -> str:
 # SOURCE TRUST (deterministic)
 # =============================
 SOURCE_TRUST: Dict[str, str] = {
-    "CISA": "Gov",
-    "SANS ISC": "Research",
+    "CISA Advisories": "Gov",
+    "SANS Internet Storm Center (Full)": "Research",
     "Microsoft Security Blog": "Vendor",
-    "Google Security": "Vendor",
+    "Google Security Blog": "Vendor",
     "Google Threat Analysis Group (TAG)": "Research",
-    "Mandiant / GTIG": "Research",
+    "Google Cloud - Threat Intelligence (Mandiant/GTIG)": "Research",
     "Palo Alto Unit 42": "Research",
-    "Proofpoint": "Vendor",
-    "Sophos": "Vendor",
+    "Proofpoint (main RSS)": "Vendor",
+    "Sophos - Threat Research": "Vendor",
+    "Sophos - Security Operations": "Vendor",
+    "Cisco Security - Event Responses": "Vendor",
+    "JPCERT/CC (English RSS)": "Research",
+    "JPCERT/CC Blog (Atom)": "Research",
+    "GovCERT.HK - Security Alerts": "Gov",
+    "GovCERT.HK - Security Blogs": "Gov",
+    "Kaspersky Securelist": "Vendor",
+    "Krebs on Security": "Blog",
 }
+
 TRUST_ORDER = ["Gov", "Vendor", "Research", "Blog"]
 
 
@@ -281,7 +312,7 @@ def audit_auth_event(
         "ip": _client_ip(),
         "ua": (_user_agent() or "")[:240],
         "reason": (reason or "")[:200],
-        "ts_utc": now_utc().isoformat(),
+        "ts_utc": now_utc().replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
 
     if extra:
@@ -757,7 +788,7 @@ def _rel_time_from_any(value: Any) -> str:
         if not dt:
             return ""
 
-        now = datetime.utcnow()  # naive UTC
+        now = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC
         sec = int((now - dt).total_seconds())
         if sec < 0:
             sec = 0
@@ -775,6 +806,8 @@ def _rel_time_from_any(value: Any) -> str:
     except Exception:
         return ""
 
+def iso_utc_z(dt: datetime) -> str:
+    return dt.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 
@@ -996,7 +1029,7 @@ def compute_campaign_label(story: Dict[str, Any]) -> str:
 
 
 def ensure_campaign_tables() -> None:
-    conn = sqlite3.connect(STATE_DB_PATH)
+    conn = _db_conn()
     try:
         conn.execute(
             """
@@ -1046,7 +1079,7 @@ def upsert_campaign_from_story(*, tenant_id: str, story: Dict[str, Any]) -> None
     if isinstance(pub, datetime):
         pub_utc = pub.isoformat(timespec="seconds") + "Z"
 
-    conn = sqlite3.connect(STATE_DB_PATH)
+    conn = _db_conn()
     try:
         row = conn.execute(
             "SELECT story_count, first_seen_utc, last_seen_utc FROM campaigns WHERE tenant_id=? AND campaign_id=?",
@@ -1100,7 +1133,7 @@ def record_campaign_event(
 ) -> None:
     ensure_campaign_tables()
     ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    conn = sqlite3.connect(STATE_DB_PATH)
+    conn = _db_conn()
     try:
         conn.execute(
             """
@@ -1217,7 +1250,7 @@ def build_campaign_graph(stories: List[Dict[str, Any]], campaign_label: str) -> 
 # FEATURE 3: STORY LIFECYCLE TIMELINE (append-only)
 # =============================
 def ensure_story_lifecycle_tables() -> None:
-    conn = sqlite3.connect(STATE_DB_PATH)
+    conn = _db_conn()
     try:
         conn.execute(
             """
@@ -1287,7 +1320,7 @@ def _log_story_lifecycle_event(
             return
 
         ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        conn = sqlite3.connect(STATE_DB_PATH)
+        conn = _db_conn()
         try:
             conn.execute(
                 """
@@ -1321,7 +1354,7 @@ def _log_story_lifecycle_event(
 
 
 def get_story_lifecycle_events(*, tenant_id: str, story_id: str, limit: int = 120) -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(STATE_DB_PATH)
+    conn = _db_conn()
     try:
         cur = conn.execute(
             """
@@ -1663,6 +1696,8 @@ ALLOWED_PARAMS = {
     "stack",
     "delta",
     "actor",
+    "mine",
+    "kpi",
 }
 
 SEV_ORDER = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
@@ -1674,6 +1709,9 @@ def get_params_dict() -> Dict[str, Any]:
     view = (request.args.get("view") or "cards").strip()
     exclude = (request.args.get("exclude") or "").strip()
     kw = (request.args.get("kw") or "").strip()
+    mine = (request.args.get("mine", "").strip() == "1")
+    kpi = (request.args.get("kpi", "").strip())
+
 
     sources_raw = (request.args.get("sources") or "").strip()
     sources = parse_sources_param(sources_raw)
@@ -1745,8 +1783,10 @@ def get_params_dict() -> Dict[str, Any]:
         "stack": stack,
         "delta": delta,
         "actor": actor,
-        
+        "mine": mine,
+        "kpi": kpi,
     }
+
 
 
 def clean_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1884,7 +1924,7 @@ def find_story(stories: List[Dict[str, Any]], story_id: str) -> Optional[Dict[st
 
 
 def _delta_filter(stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cutoff = now_utc() - timedelta(hours=24)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
     def updated_recent(s: Dict[str, Any]) -> bool:
         u = (s.get("updated_utc") or "").strip()
@@ -1981,8 +2021,17 @@ def build_for_request() -> Tuple[
     # Seen map for current view
     story_ids = [s["story_id"] for s in stories]
     seen_map = get_seen_map(story_ids, uid, tenant_id=tenant_id) if uid else {}
+
     for s in stories:
         s["seen"] = bool(seen_map.get(s["story_id"], False))
+        s["last_seen_utc"] = ""
+        if uid and s["seen"]:
+            try:
+                info = get_seen_info(s["story_id"], uid, tenant_id=tenant_id) or {}
+                s["last_seen_utc"] = str(info.get("last_seen_utc") or "")
+            except Exception:
+                s["last_seen_utc"] = ""
+
 
     # Seen map for all stories (so "X new since ..." counts are global, not filter-only)
     all_ids = [s["story_id"] for s in all_stories]
@@ -2032,7 +2081,7 @@ def build_for_request() -> Tuple[
     # ✅ NEW SINCE LAST LOGIN (per-user)
     # =============================
     new_since_dt, new_since_label = current_user_new_since_dt()
-    new_since_utc = new_since_dt.isoformat()
+    new_since_utc = iso_utc_z(new_since_dt)
 
     # mark "is_new" on the currently displayed stories
     for s in stories:
@@ -2208,10 +2257,11 @@ def login_get():
 @app.post("/logout")
 def logout_post():
     # Optional CSRF check (recommended)
-    sent = (request.form.get("csrf") or "").strip()
     expected = (session.get("csrf") or "").strip()
+    sent = (request.form.get("csrf") or "").strip() or (request.headers.get("X-CSRF-Token") or "").strip()
     if expected and sent != expected:
         return Response("CSRF failed", status=403)
+
 
     session.clear()
     resp = redirect("/login")
@@ -2222,11 +2272,8 @@ def logout_post():
 
 @app.get("/logout")
 def logout_get_fallback():
-    # Fallback if someone hits /logout directly in the URL bar
-    session.clear()
-    resp = redirect("/login")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    return Response("Use POST /logout", status=405)
+
 
 
 
@@ -2390,6 +2437,10 @@ def index():
         new_since_label,
         new_since_utc,
     ) = build_for_request()
+    tenant_id = current_tenant_id()
+    uid = current_user_id()
+    email = current_user_email()
+
 
     actor = (params.get("actor") or "").strip()
 
@@ -2537,6 +2588,86 @@ def index():
     # Delta count (keep simple for now)
     filter_counts["delta"] = int(delta_new_count or 0)
 
+    user_kpis: Dict[str, Any] = {}
+    if uid and email:
+        now_dt = now_utc()
+        cutoff_24h = iso_utc_z(now_dt - timedelta(hours=24))
+        cutoff_7d = iso_utc_z(now_dt - timedelta(days=7))
+
+
+        user_kpis = {
+            "assigned_open": user_assigned_open_count(tenant_id=tenant_id, owner_email=email),
+            "assigned_done": user_assigned_done_count(tenant_id=tenant_id, owner_email=email),
+            "unreviewed_assigned": user_unreviewed_assigned_open_count(
+                tenant_id=tenant_id, user_id=str(uid), owner_email=email
+            ),
+            "reviewed_total": user_reviewed_total(tenant_id=tenant_id, user_id=str(uid)),
+            "reviewed_24h": user_reviewed_since(tenant_id=tenant_id, user_id=str(uid), cutoff_utc_iso=cutoff_24h),
+            "reviewed_7d": user_reviewed_since(tenant_id=tenant_id, user_id=str(uid), cutoff_utc_iso=cutoff_7d),
+        }
+
+    # ===== Phase 2: user KPI drilldowns =====
+    mine = bool(params.get("mine"))
+    kpi = str(params.get("kpi") or "").strip()
+    is_authed = bool(uid)
+
+    if mine and is_authed:
+        me = (email or "").strip().lower()
+        stories = [st for st in stories if (st.get("owner", "") or "").strip().lower() == me]
+
+    # Define "done" statuses conservatively; everything else counts as "open"
+    
+
+    _DONE = {s.strip().lower() for s in (DONE_STATUS_VALUES or [])}
+
+    def _is_done(status: str) -> bool:
+        return (status or "").strip().lower() in _DONE
+
+
+    if is_authed and kpi:
+        if kpi == "assigned_open":
+            stories = [st for st in stories if not _is_done(st.get("status", ""))]
+
+        elif kpi == "assigned_done":
+            stories = [st for st in stories if _is_done(st.get("status", ""))]
+
+        elif kpi == "unreviewed_assigned":
+            stories = [
+                st for st in stories
+                if (not bool(st.get("seen", False)))
+                and (not _is_done(st.get("status", "")))
+            ]
+
+        elif kpi == "reviewed_total":
+            stories = [st for st in stories if bool(st.get("seen", False))]
+
+        elif kpi == "reviewed_24h":
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            out = []
+            for st in stories:
+                if not bool(st.get("seen", False)):
+                    continue
+
+                dt = parse_dt(str(st.get("last_seen_utc") or ""))
+                if not dt:
+                    continue
+
+                # normalize dt to UTC-aware so comparisons are valid
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+
+                if dt >= cutoff:
+                    out.append(st)
+
+            stories = out
+
+
+
+
+
+
 
     return render_template_string(
         TEMPLATES["base"],
@@ -2589,6 +2720,7 @@ def index():
         can_case_edit=has_perm("case_edit"),
         can_view_admin=has_perm("view_admin"),
         rel_time=_rel_time_from_any,   # ✅ THIS FIX
+        user_kpis=user_kpis,
 
 
     
@@ -2836,7 +2968,7 @@ def story(story_id: str):
 def _record_seen_event(*, story_id: str, user_id: str, email: str, tenant_id: str) -> None:
     ensure_admin_tables()
 
-    conn = sqlite3.connect(STATE_DB_PATH)
+    conn = _db_conn()
     try:
         cur = conn.execute("PRAGMA table_info(story_seen_events)")
         cols = [str(r[1]) for r in cur.fetchall()]

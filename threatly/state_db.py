@@ -9,7 +9,12 @@ from typing import Any, Dict, List, Optional
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from .config import STATE_DB_PATH, STATUS_VALUES
+from .config import (
+    STATE_DB_PATH,
+    STATUS_VALUES,
+    OPEN_STATUS_VALUES,
+    DONE_STATUS_VALUES,
+)
 
 
 # =============================
@@ -18,6 +23,9 @@ from .config import STATE_DB_PATH, STATUS_VALUES
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def iso_utc_now() -> str:
+    # Canonical UTC ISO seconds + trailing 'Z' for safe lexicographic compares
+    return now_utc().replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def db_connect() -> sqlite3.Connection:
@@ -117,7 +125,7 @@ def create_user(
     user_id = hashlib.sha1(email_norm.encode("utf-8", errors="ignore")).hexdigest()[:16]
     ph = generate_password_hash(password)
 
-    now = now_utc().isoformat()
+    now = iso_utc_now()
     rl = _valid_role(role)
     active = 1 if int(is_active or 0) == 1 else 0
     cb = (created_by_user_id or "").strip()[:64] or None
@@ -233,7 +241,7 @@ def verify_user(email: str, password: str) -> Optional[Dict[str, Any]]:
         return None
 
     prev_last = str(u.get("last_login_utc") or "")
-    now = now_utc().isoformat()
+    now = iso_utc_now()
 
     conn = db_connect()
     try:
@@ -431,6 +439,7 @@ def init_state_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_tenant_status ON story_meta(tenant_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_tenant_updated ON story_meta(tenant_id, updated_utc)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_tenant_owner_status ON story_meta(tenant_id, owner, status)")
 
         # Append-only audit events (paper trail)
         conn.execute(
@@ -506,7 +515,7 @@ def is_seen(story_id: str, user_id: str, tenant_id: str = "default") -> bool:
 
 
 def mark_seen(story_id: str, user_id: str, tenant_id: str = "default") -> None:
-    now = now_utc().isoformat()
+    now = iso_utc_now()
     conn = db_connect()
     try:
         conn.execute(
@@ -676,7 +685,7 @@ def upsert_story_meta(
     st = _sanitize_status(status)
     ow = (owner or "").strip()[:120]
     nt = (notes or "").strip()[:5000]
-    now = now_utc().isoformat()
+    now = iso_utc_now()
 
     store_full_notes_in_audit = _truthy_env("AUDIT_STORE_FULL_NOTES", "0")
 
@@ -865,7 +874,7 @@ def record_story_fingerprint(
     fp = (fingerprint or "").strip()
     if not fp:
         return
-    now = now_utc().isoformat()
+    now = iso_utc_now()
     title_s = (title_sample or "").strip()[:180]
     conn = db_connect()
     try:
@@ -1073,6 +1082,122 @@ def get_story_assignment_counts_window(
         ).fetchall()
 
         return [{"assignee": str(r["assignee"]), "n": int(r["n"] or 0)} for r in rows]
+    finally:
+        conn.close()
+
+
+# =============================
+# USER KPI HELPERS
+# =============================
+
+def user_assigned_open_count(*, tenant_id: str, owner_email: str) -> int:
+    """
+    Count stories assigned to this owner that are still "open".
+    Open statuses are New + Investigating.
+    """
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(1) AS n
+            FROM story_meta
+            WHERE tenant_id = ?
+              AND COALESCE(owner,'') = ?
+              AND COALESCE(status,'New') IN ({",".join(["?"] * len(OPEN_STATUS_VALUES))})
+            """,
+            [tenant_id, (owner_email or "").strip()] + list(OPEN_STATUS_VALUES),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+    finally:
+        conn.close()
+
+
+def user_assigned_done_count(*, tenant_id: str, owner_email: str) -> int:
+    """
+    Count stories assigned to this owner that are "done".
+    Done statuses are Not Relevant + Mitigated.
+    """
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(1) AS n
+            FROM story_meta
+            WHERE tenant_id = ?
+              AND COALESCE(owner,'') = ?
+              AND COALESCE(status,'New') IN ({",".join(["?"] * len(DONE_STATUS_VALUES))})
+            """,
+            [tenant_id, (owner_email or "").strip()] + list(DONE_STATUS_VALUES),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+    finally:
+        conn.close()
+
+
+def user_reviewed_total(*, tenant_id: str, user_id: str) -> int:
+    """
+    Total stories this user has reviewed (ever).
+    """
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(1) AS n
+            FROM seen_stories
+            WHERE tenant_id = ?
+              AND user_id = ?
+            """,
+            (tenant_id, user_id),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+    finally:
+        conn.close()
+
+
+def user_reviewed_since(*, tenant_id: str, user_id: str, cutoff_utc_iso: str) -> int:
+    """
+    How many stories this user reviewed since cutoff.
+    last_seen_utc is stored as ISO; lexicographic compare works.
+    """
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(1) AS n
+            FROM seen_stories
+            WHERE tenant_id = ?
+              AND user_id = ?
+              AND last_seen_utc >= ?
+            """,
+            (tenant_id, user_id, cutoff_utc_iso),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+    finally:
+        conn.close()
+
+
+def user_unreviewed_assigned_open_count(*, tenant_id: str, user_id: str, owner_email: str) -> int:
+    """
+    Open stories assigned to owner_email that this user has NOT reviewed.
+    """
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(1) AS n
+            FROM story_meta m
+            LEFT JOIN seen_stories s
+              ON s.tenant_id = m.tenant_id
+             AND s.story_id = m.story_id
+             AND s.user_id = ?
+            WHERE m.tenant_id = ?
+              AND COALESCE(m.owner,'') = ?
+              AND COALESCE(m.status,'New') IN ({",".join(["?"] * len(OPEN_STATUS_VALUES))})
+              AND s.story_id IS NULL
+            """,
+            [user_id, tenant_id, (owner_email or "").strip()] + list(OPEN_STATUS_VALUES),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
     finally:
         conn.close()
 
@@ -1770,9 +1895,10 @@ def story_drilldown(
 
         # ---- TOTAL COUNT (wrap base query) ----
         total_row = conn.execute(
-            f"SELECT COUNT(*) AS c FROM ({base_sql})",
+            f"SELECT COUNT(*) AS c FROM ({base_sql}) AS q",
             params,
         ).fetchone()
+
         total = int(total_row["c"] or 0) if total_row else 0
 
         # ---- PAGINATED ROWS ----

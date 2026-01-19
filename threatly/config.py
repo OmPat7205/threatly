@@ -145,6 +145,9 @@ KEV_CACHE_TTL_SECONDS = 12 * 60 * 60
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH", "state/state.db")
 
 STATUS_VALUES = ["New", "Investigating", "Not Relevant", "Mitigated"]
+OPEN_STATUS_VALUES = ["New", "Investigating"]
+DONE_STATUS_VALUES = ["Not Relevant", "Mitigated"]
+
 
 WATCHLIST_PATH = os.environ.get("WATCHLIST_PATH", os.path.join("state", "watchlist.json"))
 

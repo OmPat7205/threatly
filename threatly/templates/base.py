@@ -1340,7 +1340,7 @@ BASE_TEMPLATE = r"""
 
             {# Reviewed total #}
             {% set v_total = (uk.reviewed_total|default(0))|int %}
-            <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'reviewed_total'}) }}" title="View all stories you have reviewed">
+            <a class="kpi-link" href="/?{{ qs({'kpi':'reviewed_total'}) }}" title="View all stories you have reviewed">
               <div class="kpi">
                 <div class="k">Reviewed total</div>
                 <div class="v">{{ v_total }}</div>
@@ -1350,7 +1350,7 @@ BASE_TEMPLATE = r"""
 
             {# Reviewed 24h #}
             {% set v_24 = (uk.reviewed_24h|default(0))|int %}
-            <a class="kpi-link" href="/?{{ qs({'mine':'1','kpi':'reviewed_24h'}) }}" title="View stories you reviewed in the last 24 hours">
+            <a class="kpi-link" href="/?{{ qs({'kpi':'reviewed_24h'}) }}" title="View stories you reviewed in the last 24 hours">
               <div class="kpi {% if v_24 >= 25 %}good{% elif v_24 >= 10 %}good{% else %}warn{% endif %}">
                 <div class="k">Reviewed (24h)</div>
                 <div class="v">{{ v_24 }}</div>

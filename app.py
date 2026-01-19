@@ -2588,26 +2588,66 @@ def index():
     # Delta count (keep simple for now)
     filter_counts["delta"] = int(delta_new_count or 0)
 
+    # -----------------------------
+    # Phase 2: User KPIs (view-scoped, consistent with drilldowns)
+    # -----------------------------
     user_kpis: Dict[str, Any] = {}
+
+    # Shared status helper (also used below by drilldowns)
+    _DONE = {s.strip().lower() for s in (DONE_STATUS_VALUES or [])}
+
+    def _is_done(status: str) -> bool:
+        return (status or "").strip().lower() in _DONE
+
     if uid and email:
-        now_dt = now_utc()
-        cutoff_24h = iso_utc_z(now_dt - timedelta(hours=24))
-        cutoff_7d = iso_utc_z(now_dt - timedelta(days=7))
+        me = (email or "").strip().lower()
+
+        # Assignment-scoped sets
+        mine_stories = [
+            st for st in base
+            if (st.get("owner", "") or "").strip().lower() == me
+        ]
+
+        assigned_open = [st for st in mine_stories if not _is_done(st.get("status", ""))]
+        assigned_done = [st for st in mine_stories if _is_done(st.get("status", ""))]
+        unreviewed_assigned = [st for st in assigned_open if not _is_seen(st)]
+
+        # Review-scoped sets (NOT assignment-scoped)
+        reviewed = [st for st in base if _is_seen(st)]
+
+        cutoff_24h_dt = (now_utc() - timedelta(hours=24))
+        if cutoff_24h_dt.tzinfo is None:
+            cutoff_24h_dt = cutoff_24h_dt.replace(tzinfo=timezone.utc)
+        else:
+            cutoff_24h_dt = cutoff_24h_dt.astimezone(timezone.utc)
+
+
+        reviewed_24h = []
+        for st in reviewed:
+            dt = parse_dt(str(st.get("last_seen_utc") or ""))
+            if not dt:
+                continue
+            # normalize BOTH dt and cutoff to UTC-aware
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+
+            # cutoff_24h_dt is already normalized above, but keep comparison safe
+            if dt >= cutoff_24h_dt:
+                reviewed_24h.append(st)
 
 
         user_kpis = {
-            "assigned_open": user_assigned_open_count(tenant_id=tenant_id, owner_email=email),
-            "assigned_done": user_assigned_done_count(tenant_id=tenant_id, owner_email=email),
-            "unreviewed_assigned": user_unreviewed_assigned_open_count(
-                tenant_id=tenant_id, user_id=str(uid), owner_email=email
-            ),
-            "reviewed_total": user_reviewed_total(tenant_id=tenant_id, user_id=str(uid)),
-            "reviewed_24h": user_reviewed_since(tenant_id=tenant_id, user_id=str(uid), cutoff_utc_iso=cutoff_24h),
-            "reviewed_7d": user_reviewed_since(tenant_id=tenant_id, user_id=str(uid), cutoff_utc_iso=cutoff_7d),
+            "assigned_open": len(assigned_open),
+            "assigned_done": len(assigned_done),
+            "unreviewed_assigned": len(unreviewed_assigned),
+            "reviewed_total": len(reviewed),
+            "reviewed_24h": len(reviewed_24h),
         }
 
     # ===== Phase 2: user KPI drilldowns =====
-    mine = bool(params.get("mine"))
+    mine = str(params.get("mine") or "").strip().lower() in {"1", "true", "yes", "on"}
     kpi = str(params.get("kpi") or "").strip()
     is_authed = bool(uid)
 
@@ -2617,11 +2657,6 @@ def index():
 
     # Define "done" statuses conservatively; everything else counts as "open"
     
-
-    _DONE = {s.strip().lower() for s in (DONE_STATUS_VALUES or [])}
-
-    def _is_done(status: str) -> bool:
-        return (status or "").strip().lower() in _DONE
 
 
     if is_authed and kpi:
@@ -2634,18 +2669,18 @@ def index():
         elif kpi == "unreviewed_assigned":
             stories = [
                 st for st in stories
-                if (not bool(st.get("seen", False)))
+                if (not _is_seen(st))
                 and (not _is_done(st.get("status", "")))
             ]
 
         elif kpi == "reviewed_total":
-            stories = [st for st in stories if bool(st.get("seen", False))]
+            stories = [st for st in stories if _is_seen(st)]
 
         elif kpi == "reviewed_24h":
             cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
             out = []
             for st in stories:
-                if not bool(st.get("seen", False)):
+                if not _is_seen(st):
                     continue
 
                 dt = parse_dt(str(st.get("last_seen_utc") or ""))

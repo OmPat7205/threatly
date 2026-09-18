@@ -12,7 +12,7 @@ def _env_bool(name: str, default: str = "0") -> bool:
 # =============================
 # REQUIRED for login sessions. In Docker/prod you should set this to a long random value.
 # Example: SECRET_KEY="a-very-long-random-string"
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-change-me")
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
 
 # If True, users must log in to view the dashboard. If False, viewing is allowed but write actions require login.
 AUTH_REQUIRE_LOGIN = _env_bool("AUTH_REQUIRE_LOGIN", "0")

@@ -34,3 +34,8 @@ venv/
 *.db
 state.db
 seen.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
